@@ -1,0 +1,10 @@
+# --- Phase 1: core (backbone + prototypes) ---
+torch>=2.7.1
+torchvision>=0.20.0
+numpy>=1.26
+
+# --- will be needed starting Phase 1 step 3 (capture/enroll/live) ---
+opencv-python>=4.9
+
+# --- dev / testing ---
+pytest>=8.0
