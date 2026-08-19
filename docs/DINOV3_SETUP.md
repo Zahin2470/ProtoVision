@@ -69,7 +69,35 @@ embeddings of two photos of the same real object vs. two different objects
 (exactly the acceptance check described in the original brief) once you have
 a camera to grab crops with.
 
-## macOS-specific things to check (I can't verify these from here)
+## 5. Once the camera side is ready to try (Step 3)
+
+`enroll.py`/`live.py`'s logic is fully unit tested, but the actual `run()`
+camera loops need your hardware. Once real weights are in place from step 4
+above, a minimal manual check on your machine:
+
+```bash
+python -c "
+from protovision.backbone import load_default_backbone
+from protovision.prototypes import PrototypeStore
+from protovision.enroll import EnrollApp
+
+bb = load_default_backbone()
+store = PrototypeStore()
+app = EnrollApp('test_object', bb, store, 'data/prototypes.json', target_examples=5, min_examples=3)
+app.run()   # SPACE to capture, 'u' to undo, Enter to finish, Esc to cancel
+"
+```
+
+Things worth watching for the first time you run this on your Mac:
+- Whether the terminal/IDE prompts for camera permission the first time
+  (`CameraOpenError` with a permissions hint is raised if it's denied —
+  see the note in `capture.py`).
+- Whether a 50%-of-shorter-side guide box (the default) feels like a
+  comfortable size to hold an object inside — I can't judge that from here.
+- Rough perceived latency per capture, which will inform the `frame_skip`
+  default we pick for `live.py` once we get to timing it properly.
+
+## 6. macOS-specific things to check (I can't verify these from here)
 
 - The DINOv3 repo says it's tested on Linux + PyTorch ≥2.7.1. Pure inference
   (no training-only ops) is very likely fine on macOS CPU, but please

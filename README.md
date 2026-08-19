@@ -1,23 +1,36 @@
 <div align="center">
 
-# ProtoVision
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f172a,25:1e3a8a,55:2563eb,80:6366f1,100:8b5cf6&height=140&section=header&text=🔬%20Proto+Vision&fontSize=64&fontAlignY=38&animation=fadeIn&fontColor=ffffff" width="100%" alt="ProtoVision"/>
 
-### Self-Supervised Few-Shot Object Recognition with DINOv3
+<h2>🔬 Self-Supervised Few-Shot Object Recognition</h2>
 
-<p>
-  <strong>Show it a few examples → build a prototype → recognize it live.</strong>
-</p>
+</div>
 
-<p>
-  No training loop · No fine-tuning · No GPU required
-</p>
+<br>
 
 <p>
-  <img src="https://img.shields.io/badge/Model-DINOv3%20ViT--S%2F16-111827?style=for-the-badge" alt="DINOv3 ViT-S/16">
-  <img src="https://img.shields.io/badge/Embedding-384--dim-2563eb?style=for-the-badge" alt="384 dimensional embedding">
-  <img src="https://img.shields.io/badge/Matching-Cosine%20Similarity-7c3aed?style=for-the-badge" alt="Cosine similarity">
-  <img src="https://img.shields.io/badge/Tests-56%20passing-16a34a?style=for-the-badge" alt="56 tests passing">
+  <img src="https://img.shields.io/badge/🧠%20Backbone-DINOv3%20ViT--S%2F16-0f172a?style=for-the-badge">
+  <img src="https://img.shields.io/badge/🔢%20Embedding-384%20Dim-2563eb?style=for-the-badge">
+  <img src="https://img.shields.io/badge/🎯%20Similarity-Cosine-7c3aed?style=for-the-badge">
+  <img src="https://img.shields.io/badge/✅%20Tests-56%20Pass-16a34a?style=for-the-badge">
+  <img src="https://img.shields.io/badge/🔬%20Learning-Few--Shot-f97316?style=for-the-badge">
 </p>
+
+<br>
+
+<blockquote>
+  <strong>Show a few examples.</strong> Build a prototype. <strong>Recognize unseen objects instantly.</strong>
+</blockquote>
+
+</div>
+
+---
+
+<div align="center">
+
+### 🧩 The Core Idea
+
+`Examples` → `DINOv3` → `Embeddings` → `Prototype` → `Cosine Similarity` → `Prediction`
 
 </div>
 
@@ -38,9 +51,9 @@ Instead of training a classifier for every new object, ProtoVision:
 The core idea is simple:
 
 ```text
-   Example Images
-         │
-         ▼
+Example Images
+      │
+      ▼
 ┌─────────────────┐
 │ Frozen DINOv3   │
 │   ViT-S / 16    │
@@ -60,7 +73,7 @@ The core idea is simple:
          │
          ▼
 ┌─────────────────┐
-│Cosine Similarity│
+│ Cosine Similarity│
 │ mean / max mode │
 └────────┬────────┘
          │
@@ -80,20 +93,20 @@ The core idea is simple:
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **56/56 passing** |
+| 🧪 Strong test coverage | Current test suite reports **143/143 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — Steps 1–2 of 4 complete and tested**
+> **Phase 1 — Steps 1–3 of 4 complete and tested**
 
 | Step | Component | Status |
 |:---:|---|:---:|
 | **1** | `backbone.py` — frozen DINOv3 loading + embedding extraction | ✅ Complete |
 | **2** | `prototypes.py` — prototype storage + `best_match()` | ✅ Complete |
-| **3** | `capture.py` / `enroll.py` / `live.py` — camera applications | ⏳ Not started |
+| **3** | `capture.py` / `enroll.py` / `live.py` — camera applications | ✅ Logic complete & tested · camera loop itself unverified (needs real hardware) |
 | **4** | CLI — `main.py enroll` / `main.py live` | ⏳ Not started |
 
 ---
@@ -121,9 +134,9 @@ flowchart LR
 ProtoVision/
 ├── backbone.py        # DINOv3 loading + embedding extraction
 ├── prototypes.py      # Prototype storage + similarity matching
-├── capture.py         # Camera capture (planned)
-├── enroll.py          # Object enrollment (planned)
-├── live.py            # Live recognition (planned)
+├── capture.py         # Camera wrapper + guide-box geometry/crop
+├── enroll.py          # Object enrollment (capture → embed → save prototype)
+├── live.py            # Live recognition (frame-skip inference + best_match)
 ├── main.py            # CLI entry point (planned)
 ├── tests/             # Automated tests
 └── docs/
@@ -162,6 +175,27 @@ ProtoVision separates the model-loading layer from the rest of the recognition l
   `forward_features(x)["x_norm_clstoken"]`
 - Similarity sanity check between same-object and different-object crops
 
+**`capture.py` geometry**
+
+- Guide box centering, sizing (fraction of the shorter frame dimension),
+  and clamping so it always fits inside the frame — including tiny/odd
+  frame sizes
+- Cropping math (correct region pulled, out-of-bounds boxes raise instead
+  of silently corrupting)
+- Overlay drawing never mutates the source frame
+
+**`enroll.py` / `live.py` state machines**
+
+- Full capture → embed → auto-finish-at-target flow, with `min_examples`
+  enforced before a prototype can be saved
+- Undo, cancel, and key-dispatch behavior (`handle_key`) in every state
+- `live.py`'s frame-skip strategy specifically: verified with a call-counting
+  backbone that inference only re-runs every `frame_skip`-th frame and the
+  prediction is correctly held in between
+- Real `__init__` logic (label stripping, default values, injected vs.
+  auto-opened camera) exercised end-to-end with a fake in-memory camera
+  standing in for hardware
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -169,6 +203,12 @@ The following require the real DINOv3 weights and/or actual hardware:
 - Real DINOv3 semantic quality on your own photos
 - Camera FPS and inference latency on your Mac
 - Practical comfort/size of the on-screen guide box
+- The actual `run()` camera loops in `enroll.py`/`live.py` — the OpenCV
+  window, live keypresses, and real-time overlay rendering. Every piece of
+  *logic* those loops call (`handle_key`, `capture_example`,
+  `process_frame`, `render_preview`, ...) is tested; the thin loop that
+  wires them to a real window and a real camera isn't, and can't be from
+  here.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -210,8 +250,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-56 tests
-56 passed
+143 tests
+143 passed
 0 failed
 ```
 
@@ -258,6 +298,23 @@ Frame 5 ──► DINOv3 ──► Prediction B
 
 A frame-skip value such as every 5th frame is only a starting point. Real inference latency will be measured on the target machine before tuning the final value.
 
+### 4. Testing camera-dependent code without a camera
+
+`enroll.py` and `live.py` each open a real `Camera` as the very last step of
+`__init__`. To keep them testable anyway:
+
+- Every method containing actual *logic* (key handling, capture bookkeeping,
+  frame-skip inference, guide-box rendering) only touches `self`'s plain
+  attributes, never the camera directly — so it can be tested by
+  constructing the object via `__new__` (skipping `__init__` entirely) and
+  setting just those attributes.
+- `__init__`'s own logic (argument validation, label stripping, defaults,
+  camera injection) is tested separately by monkeypatching `Camera` with a
+  no-op `FakeCamera` and going through the real constructor.
+- Only the actual `run()` loop — the part that opens an OpenCV window and
+  blocks on live keypresses — is left untested, since that genuinely needs
+  a display and a webcam.
+
 ---
 
 ## 🗺️ Roadmap
@@ -267,9 +324,9 @@ A frame-skip value such as every 5th frame is only a starting point. Real infere
 - [x] Implement similarity matching
 - [x] Add open-set `unknown` fallback
 - [x] Add automated tests
-- [ ] Build camera capture flow
-- [ ] Build object enrollment flow
-- [ ] Build live recognition flow
+- [x] Build camera capture flow (guide-box geometry, cropping, overlay)
+- [x] Build object enrollment flow (capture/undo/finish/cancel state machine)
+- [x] Build live recognition flow (frame-skip inference)
 - [ ] Add CLI commands
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
@@ -286,9 +343,13 @@ The current project includes:
 
 ## ⚠️ Current Limitations
 
-ProtoVision is currently at **Phase 1, Steps 1–2**.
+ProtoVision is currently at **Phase 1, Steps 1–3**.
 
-The camera-based recognition experience and CLI have not been implemented yet, so the current repository should be understood as a **tested recognition core and embedding/prototype pipeline**, not a finished end-user camera application.
+`enroll.py`/`live.py`'s actual camera loop (`run()`) hasn't been run against
+real hardware yet, and there's no CLI to invoke any of this — so the current
+repository should be understood as a **tested recognition core, prototype
+pipeline, and camera-app state machines**, not a finished end-user
+application you can launch from the command line yet.
 
 ---
 
