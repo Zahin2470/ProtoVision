@@ -12,7 +12,6 @@
   <img src="https://img.shields.io/badge/🧠%20Backbone-DINOv3%20ViT--S%2F16-0f172a?style=for-the-badge">
   <img src="https://img.shields.io/badge/🔢%20Embedding-384%20Dim-2563eb?style=for-the-badge">
   <img src="https://img.shields.io/badge/🎯%20Similarity-Cosine-7c3aed?style=for-the-badge">
-  <img src="https://img.shields.io/badge/✅%20Tests-56%20Pass-16a34a?style=for-the-badge">
   <img src="https://img.shields.io/badge/🔬%20Learning-Few--Shot-f97316?style=for-the-badge">
 </p>
 
@@ -93,21 +92,21 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **143/143 passing** |
+| 🧪 Strong test coverage | Current test suite reports **172/172 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — Steps 1–3 of 4 complete and tested**
+> **Phase 1 — all 4 steps complete and tested**
 
 | Step | Component | Status |
 |:---:|---|:---:|
 | **1** | `backbone.py` — frozen DINOv3 loading + embedding extraction | ✅ Complete |
 | **2** | `prototypes.py` — prototype storage + `best_match()` | ✅ Complete |
 | **3** | `capture.py` / `enroll.py` / `live.py` — camera applications | ✅ Logic complete & tested · camera loop itself unverified (needs real hardware) |
-| **4** | CLI — `main.py enroll` / `main.py live` | ⏳ Not started |
+| **4** | CLI — `main.py enroll` / `main.py live` / `main.py list` | ✅ Complete & tested · real enroll/live runs need real hardware + weights |
 
 ---
 
@@ -132,18 +131,43 @@ flowchart LR
 
 ```text
 ProtoVision/
-├── backbone.py        # DINOv3 loading + embedding extraction
-├── prototypes.py      # Prototype storage + similarity matching
-├── capture.py         # Camera wrapper + guide-box geometry/crop
-├── enroll.py          # Object enrollment (capture → embed → save prototype)
-├── live.py            # Live recognition (frame-skip inference + best_match)
-├── main.py            # CLI entry point (planned)
-├── tests/             # Automated tests
+├── main.py             # CLI entry point (enroll / live / list)
+├── protovision/
+│   ├── backbone.py     # DINOv3 loading + embedding extraction
+│   ├── prototypes.py   # Prototype storage + similarity matching
+│   ├── capture.py      # Camera wrapper + guide-box geometry/crop
+│   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
+│   └── live.py         # Live recognition (frame-skip inference + best_match)
+├── tests/              # Automated tests (172, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
 
 ---
+
+## 🖥️ Usage (CLI)
+
+```bash
+# Enroll a new object class — SPACE to capture, u to undo, Enter to finish
+# early (once you've hit --min-examples), Esc to cancel
+python main.py enroll --label mug
+
+# with options
+python main.py enroll --label mug --target-examples 10 --min-examples 6 --box-fraction 0.6
+
+# Live recognition against everything enrolled so far — q or Esc to quit
+python main.py live
+
+# with options
+python main.py live --threshold 0.6 --match-mode max --frame-skip 3
+
+# See what's enrolled — reads the store only, no camera or backbone needed
+python main.py list
+```
+
+`enroll`/`live` both need the real DINOv3 repo + weights in place first (see
+`docs/DINOV3_SETUP.md`) — `list` doesn't, it just reads `data/prototypes.json`.
+Every flag has a `--help`: `python main.py enroll --help`.
 
 ## 🧪 What Is Actually Tested?
 
@@ -196,6 +220,20 @@ ProtoVision separates the model-loading layer from the rest of the recognition l
   auto-opened camera) exercised end-to-end with a fake in-memory camera
   standing in for hardware
 
+**`main.py` CLI**
+
+- Argument parsing: defaults, overrides, required flags, `choices=` validation
+  (e.g. rejecting an invalid `--match-mode` or `--device`), and that shared
+  flags (`--store`, `--device`, ...) work whether given before or after the
+  subcommand
+- `list` end-to-end (it needs neither a camera nor a backbone, so nothing's
+  mocked there — it's tested exactly as it runs for real)
+- `enroll`/`live` command wiring: correct arguments passed through to
+  `EnrollApp`/`LiveApp`, success vs. cancelled exit codes, the "no classes
+  enrolled yet" warning, and a clean `exit(1)` with a readable message
+  instead of a raw traceback when DINOv3 isn't set up yet — all via a fake
+  backbone/app, since the real ones need actual hardware
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -209,6 +247,10 @@ The following require the real DINOv3 weights and/or actual hardware:
   `process_frame`, `render_preview`, ...) is tested; the thin loop that
   wires them to a real window and a real camera isn't, and can't be from
   here.
+- Running `python main.py enroll`/`python main.py live` for real — the CLI's
+  own argument parsing and dispatch logic is tested (see above), but an
+  actual end-to-end run needs the real backbone and a webcam, neither of
+  which exist in this sandbox.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -250,8 +292,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-143 tests
-143 passed
+172 tests
+172 passed
 0 failed
 ```
 
@@ -315,6 +357,18 @@ A frame-skip value such as every 5th frame is only a starting point. Real infere
   blocks on live keypresses — is left untested, since that genuinely needs
   a display and a webcam.
 
+### 5. Testing the CLI without a camera or real weights
+
+`main.py`'s `enroll`/`live` commands ultimately call `load_default_backbone()`
+and construct a real `EnrollApp`/`LiveApp`, both of which need hardware this
+sandbox doesn't have. So the CLI is tested one layer up: `load_default_backbone`,
+`EnrollApp`, and `LiveApp` are monkeypatched with fakes for the dispatch tests
+(`cmd_enroll`/`cmd_live`), which verifies argument wiring, exit codes, and the
+"no classes enrolled" warning without touching hardware. `cmd_list` needs
+neither a camera nor a backbone at all, so it's tested exactly as it runs for
+real. Argument *parsing* (`build_parser()`) is tested directly with no mocking
+needed, since it's pure `argparse` logic.
+
 ---
 
 ## 🗺️ Roadmap
@@ -327,7 +381,7 @@ A frame-skip value such as every 5th frame is only a starting point. Real infere
 - [x] Build camera capture flow (guide-box geometry, cropping, overlay)
 - [x] Build object enrollment flow (capture/undo/finish/cancel state machine)
 - [x] Build live recognition flow (frame-skip inference)
-- [ ] Add CLI commands
+- [x] Add CLI commands (`enroll` / `live` / `list`)
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -343,13 +397,21 @@ The current project includes:
 
 ## ⚠️ Current Limitations
 
-ProtoVision is currently at **Phase 1, Steps 1–3**.
+**Phase 1 is complete.** All four steps — backbone, prototype storage,
+camera-app logic, and CLI — are built and unit tested (172/172 passing).
 
-`enroll.py`/`live.py`'s actual camera loop (`run()`) hasn't been run against
-real hardware yet, and there's no CLI to invoke any of this — so the current
-repository should be understood as a **tested recognition core, prototype
-pipeline, and camera-app state machines**, not a finished end-user
-application you can launch from the command line yet.
+What hasn't happened yet, and can't happen from this sandbox:
+
+- The real DINOv3 repo + weights haven't been loaded and run for real (gated,
+  requires your machine — see `docs/DINOV3_SETUP.md`)
+- `python main.py enroll` / `python main.py live` haven't been run
+  end-to-end against a real webcam
+- No real-world semantic-quality check yet (same object → higher similarity
+  than a different object, on actual photos rather than the mock model)
+
+Once those checks pass on your machine, Phase 1 is genuinely done and Phase 2
+(visual design system — Poppins typography, glass-panel HUD, the live
+similarity-meter HUD, theme switching, audio) is next, per the original brief.
 
 ---
 
