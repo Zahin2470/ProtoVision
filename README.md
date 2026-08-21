@@ -92,21 +92,25 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **172/172 passing** |
+| 🧪 Strong test coverage | Current test suite reports **220/220 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — all 4 steps complete and tested**
+> **Phase 1 — all 4 steps complete and tested. Phase 2 — in progress.**
 
-| Step | Component | Status |
-|:---:|---|:---:|
-| **1** | `backbone.py` — frozen DINOv3 loading + embedding extraction | ✅ Complete |
-| **2** | `prototypes.py` — prototype storage + `best_match()` | ✅ Complete |
-| **3** | `capture.py` / `enroll.py` / `live.py` — camera applications | ✅ Logic complete & tested · camera loop itself unverified (needs real hardware) |
-| **4** | CLI — `main.py enroll` / `main.py live` / `main.py list` | ✅ Complete & tested · real enroll/live runs need real hardware + weights |
+| Phase | Step | Component | Status |
+|:---:|:---:|---|:---:|
+| 1 | **1** | `backbone.py` — frozen DINOv3 loading + embedding extraction | ✅ Complete |
+| 1 | **2** | `prototypes.py` — prototype storage + `best_match()` | ✅ Complete |
+| 1 | **3** | `capture.py` / `enroll.py` / `live.py` — camera applications | ✅ Logic complete & tested · camera loop itself unverified (needs real hardware) |
+| 1 | **4** | CLI — `main.py enroll` / `main.py live` / `main.py list` | ✅ Complete & tested · real enroll/live runs need real hardware + weights |
+| 2 | **1** | `ui.py` — Poppins typography (glyph cache) + theme palettes | ✅ Complete & tested |
+| 2 | **2** | `ui.py` — glass-panel HUD + cinematic vignette | ⏳ Not started |
+| 2 | **3** | `ui.py` — similarity-meter signature visual | ⏳ Not started |
+| 2 | **4** | Ambient audio + SFX (fail-soft) | ⏳ Not started |
 
 ---
 
@@ -137,8 +141,11 @@ ProtoVision/
 │   ├── prototypes.py   # Prototype storage + similarity matching
 │   ├── capture.py      # Camera wrapper + guide-box geometry/crop
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
-│   └── live.py         # Live recognition (frame-skip inference + best_match)
-├── tests/              # Automated tests (172, all passing)
+│   ├── live.py         # Live recognition (frame-skip inference + best_match)
+│   └── ui.py            # Visual design system: Poppins typography + themes so far
+├── assets/
+│   └── fonts/           # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
+├── tests/              # Automated tests (220, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -234,6 +241,29 @@ ProtoVision separates the model-loading layer from the rest of the recognition l
   instead of a raw traceback when DINOv3 isn't set up yet — all via a fake
   backbone/app, since the real ones need actual hardware
 
+**`ui.py` typography + themes** — tested against the REAL bundled Poppins
+font files, not a mock (no gating/licensing issue for a Google Font, so no
+reason to fake it):
+
+- Font loading, per-character advance widths, and `measure_text()` against
+  all four bundled weights
+- Glyph caching: repeated lookups return the identical cached object (proven
+  via `is`, not just equal values); different color/size produce genuinely
+  different cache entries; BGR color is applied correctly (checked by
+  inspecting actual rendered pixel values, not just trusting the code path)
+- **The strong one:** `draw_text()`'s output is compared PIXEL-BY-PIXEL
+  against a direct, one-shot PIL render of the same string, across several
+  strings/sizes/weights. This caught a real bug during development — summing
+  pre-rounded per-character advances let rounding error accumulate and
+  visibly drift the cursor on longer strings (a few px by the end of
+  `"ProtoVision"`). Fixed by accumulating unrounded advances and rounding
+  only once per glyph at blit time; now within ±1 pixel per channel almost
+  everywhere.
+- Out-of-bounds text (partially off any edge, negative position) doesn't crash
+- Theme palette validity (every color is a real BGR triple, alpha/vignette
+  values in `[0, 1]`) and the theme-cycling state machine, including the
+  `T`-key handler and wraparound
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -251,6 +281,10 @@ The following require the real DINOv3 weights and/or actual hardware:
   own argument parsing and dispatch logic is tested (see above), but an
   actual end-to-end run needs the real backbone and a webcam, neither of
   which exist in this sandbox.
+- Whether the typography/theme system actually looks good composited over a
+  live, moving camera feed rather than a flat synthetic test frame — pixel
+  correctness against PIL is verified; on-screen taste isn't something this
+  sandbox can judge.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -292,8 +326,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-172 tests
-172 passed
+220 tests
+220 passed
 0 failed
 ```
 
@@ -369,6 +403,29 @@ neither a camera nor a backbone at all, so it's tested exactly as it runs for
 real. Argument *parsing* (`build_parser()`) is tested directly with no mocking
 needed, since it's pure `argparse` logic.
 
+### 6. Why bundle Poppins directly instead of asking you to copy it over
+
+Poppins is a Google Font under the SIL Open Font License, which explicitly
+allows redistribution — so rather than have you manually copy the `.ttf`
+files over from SignSense's assets before anything in `ui.py` would even
+load, the four static weights that exist for Poppins (Light/Regular/Medium/
+Bold — there's no separate SemiBold/ExtraBold release for this font) are
+committed straight into `assets/fonts/`. `assets/fonts/NOTICE.md` explains
+the license and how to add more weights from your own assets if you want
+them later.
+
+### 7. Why glyphs are cached per-character, not per-string
+
+The brief calls for caching "text patches" rather than re-rendering every
+frame — but a naive per-*string* cache (`"87.3%"` → bitmap) doesn't actually
+help here, because the similarity meter's whole point is showing a number
+that changes essentially every frame; a new string means a cache miss every
+time regardless. Caching per-*character* instead means every possible string
+is built from a small, stable alphabet of glyphs that gets reused
+indefinitely — `"87.3%"` and `"12.9%"` share almost every glyph. `draw_text()`
+composites cached glyphs left-to-right rather than asking PIL to rasterize
+the whole string fresh each call.
+
 ---
 
 ## 🗺️ Roadmap
@@ -382,6 +439,11 @@ needed, since it's pure `argparse` logic.
 - [x] Build object enrollment flow (capture/undo/finish/cancel state machine)
 - [x] Build live recognition flow (frame-skip inference)
 - [x] Add CLI commands (`enroll` / `live` / `list`)
+- [x] Build Poppins typography system with glyph caching
+- [x] Build theme palette system (dark/light/neon/mono) with `T`-key cycling
+- [ ] Build glass-panel HUD + cinematic vignette
+- [ ] Build the similarity-meter signature visual
+- [ ] Add ambient audio + SFX (fail-soft)
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -398,7 +460,9 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (172/172 passing).
+camera-app logic, and CLI — are built and unit tested (220/220 passing).
+**Phase 2 is underway:** typography + themes are done; glass-panel HUD,
+vignette, the similarity meter, and audio are not built yet.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -408,10 +472,14 @@ What hasn't happened yet, and can't happen from this sandbox:
   end-to-end against a real webcam
 - No real-world semantic-quality check yet (same object → higher similarity
   than a different object, on actual photos rather than the mock model)
+- No on-screen "does this actually look good" check for the typography/theme
+  work — pixel-correctness against PIL is verified, aesthetic judgment on a
+  live feed isn't something this sandbox can do
 
-Once those checks pass on your machine, Phase 1 is genuinely done and Phase 2
-(visual design system — Poppins typography, glass-panel HUD, the live
-similarity-meter HUD, theme switching, audio) is next, per the original brief.
+Once the Phase 1 hardware checks pass on your machine and the rest of Phase 2
+(glass-panel HUD + vignette, the similarity-meter signature visual, ambient
+audio/SFX) is built, this becomes the finished portfolio piece described in
+the original brief.
 
 ---
 

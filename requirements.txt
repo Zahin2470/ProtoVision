@@ -6,5 +6,11 @@ numpy>=1.26
 # --- will be needed starting Phase 1 step 3 (capture/enroll/live) ---
 opencv-python>=4.9
 
+# --- Phase 2: visual design system (typography, glass panels, themes) ---
+# Pillow is also a transitive torchvision dependency, but ui.py imports it
+# directly for text rendering, so it's pinned explicitly rather than relying
+# on that being true forever.
+Pillow>=10.0
+
 # --- dev / testing ---
 pytest>=8.0
