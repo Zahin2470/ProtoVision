@@ -92,7 +92,7 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **220/220 passing** |
+| 🧪 Strong test coverage | Current test suite reports **274/274 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
@@ -108,7 +108,7 @@ Example Images
 | 1 | **3** | `capture.py` / `enroll.py` / `live.py` — camera applications | ✅ Logic complete & tested · camera loop itself unverified (needs real hardware) |
 | 1 | **4** | CLI — `main.py enroll` / `main.py live` / `main.py list` | ✅ Complete & tested · real enroll/live runs need real hardware + weights |
 | 2 | **1** | `ui.py` — Poppins typography (glyph cache) + theme palettes | ✅ Complete & tested |
-| 2 | **2** | `ui.py` — glass-panel HUD + cinematic vignette | ⏳ Not started |
+| 2 | **2** | `ui.py` — glass-panel HUD + cinematic vignette | ✅ Complete & tested |
 | 2 | **3** | `ui.py` — similarity-meter signature visual | ⏳ Not started |
 | 2 | **4** | Ambient audio + SFX (fail-soft) | ⏳ Not started |
 
@@ -142,10 +142,10 @@ ProtoVision/
 │   ├── capture.py      # Camera wrapper + guide-box geometry/crop
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
 │   ├── live.py         # Live recognition (frame-skip inference + best_match)
-│   └── ui.py            # Visual design system: Poppins typography + themes so far
+│   └── ui.py           # Visual design system: typography, themes, glass panels, vignette
 ├── assets/
-│   └── fonts/           # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
-├── tests/              # Automated tests (220, all passing)
+│   └── fonts/          # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
+├── tests/              # Automated tests (274, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -264,6 +264,34 @@ reason to fake it):
   values in `[0, 1]`) and the theme-cycling state machine, including the
   `T`-key handler and wraparound
 
+**`ui.py` glass-panel HUD + vignette**
+
+- Rounded-rect + gradient + border + shadow math tested at every layer, not
+  just the final composited output: the anti-aliased corner mask, the
+  border-ring mask (outer minus an inset inner mask), the vertical gradient
+  (top/bottom colors, monotonic transition), and the lighten/darken color
+  helpers that derive the gradient from a single theme color
+- Panel alpha at the exact center matches `theme.panel_fill_alpha`; alpha at
+  the true corner is near-zero (rounded away); border pixels are visibly
+  distinct from the plain fill only when `border_width > 0`
+- Shadow: tinted with `theme.shadow`, strength-scaled (0 → fully transparent,
+  confirmed by checking `alpha.max() == 0`), and rendered oversized so the
+  blur has visible falloff rather than a hard-cut edge
+- `draw_glass_panel()` composited onto frames via the same `_blit_bgra` used
+  for text (one tested compositing primitive, not two), including a
+  parametrized test that a panel positioned off *every* edge (negative x/y,
+  hanging past the right/bottom) doesn't crash and leaves far-away pixels
+  untouched
+- Vignette: strength `0` is a byte-for-byte no-op, strength `1` drives the
+  corners near-black while the center barely moves, darkening is monotonic
+  in strength, and `apply_theme_vignette()` is checked to produce output
+  identical to calling `apply_vignette()` with that theme's own strength
+  directly — not just "close", exactly equal
+- Before writing any of these tests, every theme's panel+text+vignette combo
+  was actually rendered to PNG and looked at (not just asserted on) to catch
+  anything that was numerically fine but visually wrong first — see design
+  decision #8 below
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -281,10 +309,11 @@ The following require the real DINOv3 weights and/or actual hardware:
   own argument parsing and dispatch logic is tested (see above), but an
   actual end-to-end run needs the real backbone and a webcam, neither of
   which exist in this sandbox.
-- Whether the typography/theme system actually looks good composited over a
-  live, moving camera feed rather than a flat synthetic test frame — pixel
-  correctness against PIL is verified; on-screen taste isn't something this
-  sandbox can judge.
+- Whether the typography/panel/vignette system actually looks good composited
+  over a live, MOVING camera feed rather than a static synthetic test frame or
+  a rendered-to-PNG snapshot — every theme was visually checked as a still
+  image (see design decision #8), but motion, real lighting, and a real
+  background are a different test this sandbox still can't run.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -326,8 +355,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-220 tests
-220 passed
+274 tests
+274 passed
 0 failed
 ```
 
@@ -426,6 +455,28 @@ indefinitely — `"87.3%"` and `"12.9%"` share almost every glyph. `draw_text()`
 composites cached glyphs left-to-right rather than asking PIL to rasterize
 the whole string fresh each call.
 
+### 8. Rendering to PNG and actually looking, before writing assertions
+
+Numeric assertions can all pass while the thing still looks wrong — off-by-one
+padding, a shadow rendered on the wrong side, a gradient direction flipped.
+So for both the typography work and the glass-panel/vignette work, the
+process was: render real output to PNG first, actually look at it, *then*
+write tests against the behavior confirmed correct. This is how the
+cumulative-rounding drift in `draw_text()` (design note in the typography
+section above) got caught — a pixel-diff test against direct PIL rendering
+made the drift impossible to miss, rather than a looser test that would have
+passed anyway. Every theme's glass panel + text + vignette was rendered and
+visually checked before any test in `TestRenderGlassPanel`/`TestApplyVignette`
+was written.
+
+### 9. Panels and text share one compositing primitive
+
+`draw_glass_panel()` and `draw_text()` both end up calling the same
+`_blit_bgra()` — build a self-contained BGRA patch (glyph, panel, or shadow),
+then alpha-composite it onto the frame with edge-clipping. One tested
+blending/clipping code path for the whole HUD, rather than a second bespoke
+one for panels that could drift out of sync or have its own edge-case bugs.
+
 ---
 
 ## 🗺️ Roadmap
@@ -441,7 +492,7 @@ the whole string fresh each call.
 - [x] Add CLI commands (`enroll` / `live` / `list`)
 - [x] Build Poppins typography system with glyph caching
 - [x] Build theme palette system (dark/light/neon/mono) with `T`-key cycling
-- [ ] Build glass-panel HUD + cinematic vignette
+- [x] Build glass-panel HUD + cinematic vignette
 - [ ] Build the similarity-meter signature visual
 - [ ] Add ambient audio + SFX (fail-soft)
 - [ ] Measure real CPU inference latency
@@ -460,9 +511,10 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (220/220 passing).
-**Phase 2 is underway:** typography + themes are done; glass-panel HUD,
-vignette, the similarity meter, and audio are not built yet.
+camera-app logic, and CLI — are built and unit tested (274/274 passing).
+**Phase 2 is underway:** typography, themes, glass-panel HUD, and the
+vignette are done and tested (including visual spot-checks, not just
+assertions); the similarity meter and audio are not built yet.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -472,13 +524,15 @@ What hasn't happened yet, and can't happen from this sandbox:
   end-to-end against a real webcam
 - No real-world semantic-quality check yet (same object → higher similarity
   than a different object, on actual photos rather than the mock model)
-- No on-screen "does this actually look good" check for the typography/theme
-  work — pixel-correctness against PIL is verified, aesthetic judgment on a
-  live feed isn't something this sandbox can do
+- No check of the typography/panel/vignette system composited over a live,
+  MOVING camera feed with a real background — every theme was rendered and
+  visually confirmed as a still PNG (see design decision #8), which is a real
+  check, just not the same one as watching it run live
 
 Once the Phase 1 hardware checks pass on your machine and the rest of Phase 2
-(glass-panel HUD + vignette, the similarity-meter signature visual, ambient
-audio/SFX) is built, this becomes the finished portfolio piece described in
+(the similarity-meter signature visual, ambient audio/SFX, and wiring the now-built
+panel/vignette into enroll.py/live.py's actual on-screen HUD) is built, this
+becomes the finished portfolio piece described in
 the original brief.
 
 ---

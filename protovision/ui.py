@@ -13,10 +13,15 @@ Built incrementally, same as the rest of this project. This slice covers:
      color, character) so a video loop never re-rasterizes text it's
      already drawn once.
   2. Theme palettes — dark/light/neon/mono, with a `T`-key-driven cycle.
+  3. Glass-panel HUD — rounded rect, vertical gradient fill, translucent
+     alpha, thin border, soft blurred drop shadow — and a cinematic
+     radial vignette, both themed off the same Theme dataclass.
 
-Glass-panel HUD, vignette, the similarity-meter signature visual, and audio
-are separate, later slices — this file will grow to hold them too, but
-they're not here yet.
+The similarity-meter signature visual and ambient audio/SFX are separate,
+later slices — this file will grow to hold them too, but they're not here
+yet. Panel/vignette rendering isn't wired into enroll.py/live.py's
+render_preview() yet either — that wiring happens once the similarity meter
+exists and there's an actual HUD layout to assemble.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 # ==========================================================================
 # Typography — Poppins glyph cache
@@ -363,3 +368,235 @@ class ThemeManager:
             self.cycle_next()
             return True
         return False
+
+
+# ==========================================================================
+# Glass-panel HUD
+# ==========================================================================
+#
+# Built the same way text is: render a self-contained BGRA patch with PIL/
+# numpy, then composite it with the exact same `_blit_bgra` used for
+# glyphs — one tested compositing primitive for the whole HUD, rather than
+# a second bespoke blending path just for panels.
+#
+# A panel is two layers, rendered separately and blitted in this order:
+#   1. a blurred, tinted drop shadow (rendered oversized so the blur has
+#      room to fall off past the panel's own edges)
+#   2. the panel itself: rounded corners, a subtle vertical gradient across
+#      the theme's single panel_fill color (lighter top -> darker bottom,
+#      for a "glass" sheen without introducing an unrelated color), a
+#      translucent alpha from theme.panel_fill_alpha, and a thin border.
+
+def _clamp_channel(value: float) -> int:
+    return int(max(0, min(255, round(value))))
+
+
+def _lighten(color: BGRColor, amount: float) -> BGRColor:
+    """Blend `color` toward white by `amount` (0..1)."""
+    return tuple(_clamp_channel(c + (255 - c) * amount) for c in color)  # type: ignore[return-value]
+
+
+def _darken(color: BGRColor, amount: float) -> BGRColor:
+    """Blend `color` toward black by `amount` (0..1)."""
+    return tuple(_clamp_channel(c * (1 - amount)) for c in color)  # type: ignore[return-value]
+
+
+def _vertical_gradient(width: int, height: int, top_color: BGRColor, bottom_color: BGRColor) -> np.ndarray:
+    """(height, width, 3) uint8 BGR array, linearly interpolated top to bottom."""
+    t = np.linspace(0.0, 1.0, height, dtype=np.float32).reshape(height, 1, 1)
+    top = np.array(top_color, dtype=np.float32).reshape(1, 1, 3)
+    bottom = np.array(bottom_color, dtype=np.float32).reshape(1, 1, 3)
+    grad = top * (1.0 - t) + bottom * t
+    grad = np.broadcast_to(grad, (height, width, 3))
+    return grad.astype(np.uint8)
+
+
+def _rounded_rect_mask(width: int, height: int, radius: int) -> Image.Image:
+    """Anti-aliased rounded-rectangle alpha mask (PIL 'L' mode, white=inside).
+    Rendered at 4x scale and downsampled — PIL's own rounded_rectangle draw
+    is aliased at native resolution, and jagged panel corners would be an
+    obvious tell in a "glass" HUD meant to look soft."""
+    width, height = max(1, width), max(1, height)
+    scale = 4
+    big = Image.new("L", (width * scale, height * scale), 0)
+    draw = ImageDraw.Draw(big)
+    draw.rounded_rectangle(
+        [0, 0, width * scale - 1, height * scale - 1],
+        radius=max(0, radius) * scale,
+        fill=255,
+    )
+    return big.resize((width, height), Image.LANCZOS)
+
+
+def _rounded_rect_border_mask(width: int, height: int, radius: int, border_width: int) -> Image.Image:
+    """Alpha mask of just the border ring: outer rounded-rect minus an
+    inner one inset by `border_width` on every side."""
+    outer = _rounded_rect_mask(width, height, radius)
+    if border_width <= 0:
+        return Image.new("L", (width, height), 0)
+
+    inner_w = max(1, width - border_width * 2)
+    inner_h = max(1, height - border_width * 2)
+    inner_radius = max(0, radius - border_width)
+    inner_small = _rounded_rect_mask(inner_w, inner_h, inner_radius)
+
+    inner = Image.new("L", (width, height), 0)
+    inner.paste(inner_small, (border_width, border_width))
+
+    outer_arr = np.asarray(outer, dtype=np.int16)
+    inner_arr = np.asarray(inner, dtype=np.int16)
+    ring = np.clip(outer_arr - inner_arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(ring, mode="L")
+
+
+def render_glass_panel(
+    width: int,
+    height: int,
+    theme: Theme,
+    radius: int = 16,
+    border_width: int = 2,
+    gradient_strength: float = 0.18,
+) -> np.ndarray:
+    """
+    Build a self-contained (height, width, 4) BGRA panel: rounded corners,
+    a vertical gradient across theme.panel_fill, translucent alpha from
+    theme.panel_fill_alpha, and a theme.panel_border stroke. Does NOT
+    include the drop shadow — see render_panel_shadow / draw_glass_panel.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"panel width/height must be positive, got {width}x{height}")
+    radius = max(0, min(radius, min(width, height) // 2))
+    border_width = max(0, border_width)
+
+    mask = np.asarray(_rounded_rect_mask(width, height, radius), dtype=np.float32) / 255.0
+
+    top_color = _lighten(theme.panel_fill, gradient_strength)
+    bottom_color = _darken(theme.panel_fill, gradient_strength)
+    fill_bgr = _vertical_gradient(width, height, top_color, bottom_color).astype(np.float32)
+
+    alpha = mask * float(theme.panel_fill_alpha)
+
+    if border_width > 0:
+        border_alpha = np.asarray(
+            _rounded_rect_border_mask(width, height, radius, border_width), dtype=np.float32
+        ) / 255.0
+        border_bgr = np.empty_like(fill_bgr)
+        border_bgr[:] = theme.panel_border
+        b = border_alpha[:, :, None]
+        fill_bgr = fill_bgr * (1.0 - b) + border_bgr * b
+        alpha = np.maximum(alpha, border_alpha)  # border is drawn opaque-ish regardless of panel_fill_alpha
+
+    panel = np.dstack([fill_bgr, alpha * 255.0]).astype(np.uint8)
+    return panel
+
+
+def render_panel_shadow(
+    width: int,
+    height: int,
+    theme: Theme,
+    radius: int = 16,
+    blur_radius: int = 12,
+    offset: Tuple[int, int] = (0, 6),
+    strength: float = 0.5,
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """
+    Build a blurred, theme-tinted drop-shadow patch, sized larger than the
+    panel itself so the Gaussian blur has room to fall off softly rather
+    than getting cut off at a hard edge.
+
+    Returns (bgra_patch, (dx, dy)) where (dx, dy) is the offset from the
+    panel's own top-left corner at which this patch should be blitted —
+    already accounting for both the shadow's positional offset and the
+    extra blur margin baked into the patch.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"panel width/height must be positive, got {width}x{height}")
+    if not (0.0 <= strength <= 1.0):
+        raise ValueError(f"strength must be in [0, 1], got {strength}")
+    radius = max(0, min(radius, min(width, height) // 2))
+    blur_radius = max(0, blur_radius)
+
+    margin = blur_radius * 2 + 1
+    mask = _rounded_rect_mask(width, height, radius)
+    canvas = Image.new("L", (width + margin * 2, height + margin * 2), 0)
+    canvas.paste(mask, (margin, margin))
+    if blur_radius > 0:
+        canvas = canvas.filter(ImageFilter.GaussianBlur(blur_radius))
+
+    alpha = (np.asarray(canvas, dtype=np.float32) / 255.0) * strength
+    bgr = np.empty((alpha.shape[0], alpha.shape[1], 3), dtype=np.float32)
+    bgr[:] = theme.shadow
+
+    bgra = np.dstack([bgr, alpha * 255.0]).astype(np.uint8)
+    dx, dy = offset
+    return bgra, (dx - margin, dy - margin)
+
+
+def draw_glass_panel(
+    frame: np.ndarray,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    theme: Theme,
+    radius: int = 16,
+    border_width: int = 2,
+    shadow_blur: int = 12,
+    shadow_offset: Tuple[int, int] = (0, 6),
+) -> np.ndarray:
+    """
+    Draw a themed glass panel (shadow, then fill+border) onto a COPY of
+    `frame` at (x, y) = panel top-left. Never mutates the input, same
+    convention as draw_guide_box/draw_text.
+    """
+    out = frame.copy()
+
+    shadow_bgra, (sdx, sdy) = render_panel_shadow(
+        width, height, theme, radius=radius, blur_radius=shadow_blur, offset=shadow_offset
+    )
+    _blit_bgra(out, shadow_bgra, x + sdx, y + sdy)
+
+    panel_bgra = render_glass_panel(width, height, theme, radius=radius, border_width=border_width)
+    _blit_bgra(out, panel_bgra, x, y)
+
+    return out
+
+
+# ==========================================================================
+# Cinematic vignette
+# ==========================================================================
+
+def apply_vignette(frame: np.ndarray, strength: float) -> np.ndarray:
+    """
+    Darken `frame`'s edges with a radial falloff from center, strength 0
+    (no effect) to 1 (corners driven to black). Returns a new array; never
+    mutates the input.
+
+    Distance is normalized so straight edge midpoints reach ~0.71 and the
+    four corners reach exactly 1.0 — the classic "corners darker than
+    edges" cinematic vignette shape, not a uniform frame border.
+    """
+    if not (0.0 <= strength <= 1.0):
+        raise ValueError(f"strength must be in [0, 1], got {strength}")
+    if frame.ndim != 3:
+        raise ValueError(f"Expected an HxWxC frame, got shape {frame.shape}")
+    if strength == 0.0:
+        return frame.copy()
+
+    h, w = frame.shape[:2]
+    cy, cx = h / 2.0, w / 2.0
+    y_idx, x_idx = np.indices((h, w), dtype=np.float32)
+
+    dist = np.sqrt(((x_idx - cx) / cx) ** 2 + ((y_idx - cy) / cy) ** 2) / np.sqrt(2.0)
+    dist = np.clip(dist, 0.0, 1.0)
+
+    darkness = 1.0 - strength * (dist ** 2)
+    darkness = darkness[:, :, None]  # broadcast across channels
+
+    out = frame.astype(np.float32) * darkness
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_theme_vignette(frame: np.ndarray, theme: Theme) -> np.ndarray:
+    """Convenience wrapper: apply_vignette using the theme's own configured strength."""
+    return apply_vignette(frame, theme.vignette_strength)

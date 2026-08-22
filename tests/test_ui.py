@@ -27,6 +27,16 @@ from protovision.ui import (
     ThemeManager,
     DEFAULT_THEME,
     KEY_THEME_TOGGLE,
+    render_glass_panel,
+    render_panel_shadow,
+    draw_glass_panel,
+    apply_vignette,
+    apply_theme_vignette,
+    _lighten,
+    _darken,
+    _vertical_gradient,
+    _rounded_rect_mask,
+    _rounded_rect_border_mask,
 )
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
@@ -336,3 +346,288 @@ class TestThemeManager:
         consumed = mgr.handle_key(ord("x"))
         assert consumed is False
         assert mgr.name == "dark"
+
+
+# --------------------------------------------------------------------------
+# glass panel — low-level helpers
+# --------------------------------------------------------------------------
+
+class TestColorHelpers:
+    def test_lighten_moves_toward_white(self):
+        result = _lighten((50, 50, 50), 0.5)
+        assert all(c > 50 for c in result)
+
+    def test_lighten_zero_amount_is_unchanged(self):
+        assert _lighten((50, 60, 70), 0.0) == (50, 60, 70)
+
+    def test_lighten_full_amount_reaches_white(self):
+        assert _lighten((50, 60, 70), 1.0) == (255, 255, 255)
+
+    def test_lighten_clamps_at_255(self):
+        result = _lighten((250, 250, 250), 0.9)
+        assert all(c <= 255 for c in result)
+
+    def test_darken_moves_toward_black(self):
+        result = _darken((200, 200, 200), 0.5)
+        assert all(c < 200 for c in result)
+
+    def test_darken_zero_amount_is_unchanged(self):
+        assert _darken((50, 60, 70), 0.0) == (50, 60, 70)
+
+    def test_darken_full_amount_reaches_black(self):
+        assert _darken((50, 60, 70), 1.0) == (0, 0, 0)
+
+    def test_darken_clamps_at_0(self):
+        result = _darken((2, 2, 2), 2.0)  # amount > 1, shouldn't go negative
+        assert all(c >= 0 for c in result)
+
+
+class TestVerticalGradient:
+    def test_output_shape(self):
+        grad = _vertical_gradient(40, 20, (0, 0, 0), (255, 255, 255))
+        assert grad.shape == (20, 40, 3)
+
+    def test_top_row_matches_top_color(self):
+        grad = _vertical_gradient(10, 20, (10, 20, 30), (200, 210, 220))
+        np.testing.assert_array_equal(grad[0, 0], [10, 20, 30])
+
+    def test_bottom_row_matches_bottom_color(self):
+        grad = _vertical_gradient(10, 20, (10, 20, 30), (200, 210, 220))
+        np.testing.assert_array_equal(grad[-1, 0], [200, 210, 220])
+
+    def test_gradient_is_constant_across_each_row(self):
+        grad = _vertical_gradient(15, 10, (10, 10, 10), (200, 200, 200))
+        for row in range(10):
+            assert np.all(grad[row] == grad[row, 0])
+
+    def test_monotonic_transition_top_to_bottom(self):
+        grad = _vertical_gradient(1, 30, (0, 0, 0), (255, 255, 255))
+        col = grad[:, 0, 0].astype(int)
+        assert all(b >= a for a, b in zip(col, col[1:]))  # non-decreasing
+
+
+class TestRoundedRectMask:
+    def test_output_size(self):
+        mask = _rounded_rect_mask(50, 30, 10)
+        assert mask.size == (50, 30)
+
+    def test_center_is_fully_opaque(self):
+        mask = np.asarray(_rounded_rect_mask(60, 40, 12))
+        assert mask[20, 30] == 255
+
+    def test_true_corner_is_mostly_transparent(self):
+        mask = np.asarray(_rounded_rect_mask(60, 40, 15))
+        assert mask[0, 0] < 50  # rounded away from the literal corner pixel
+
+    def test_zero_radius_is_still_a_full_rect_at_center(self):
+        mask = np.asarray(_rounded_rect_mask(40, 40, 0))
+        assert mask[20, 20] == 255
+
+    def test_border_mask_is_zero_when_border_width_zero(self):
+        mask = np.asarray(_rounded_rect_border_mask(50, 50, 10, 0))
+        assert mask.max() == 0
+
+    def test_border_mask_ring_is_near_edge_not_center(self):
+        mask = np.asarray(_rounded_rect_border_mask(60, 60, 10, 3))
+        assert mask[30, 30] == 0  # dead center: inside the "inner" cutout, not on the ring
+        # somewhere along the top edge (away from the rounded corner) should be on the ring
+        assert mask[1, 30] > 0
+
+
+# --------------------------------------------------------------------------
+# glass panel — full render
+# --------------------------------------------------------------------------
+
+class TestRenderGlassPanel:
+    def test_output_shape_and_dtype(self):
+        panel = render_glass_panel(120, 80, THEMES["dark"])
+        assert panel.shape == (80, 120, 4)
+        assert panel.dtype == np.uint8
+
+    def test_rejects_non_positive_dimensions(self):
+        with pytest.raises(ValueError):
+            render_glass_panel(0, 80, THEMES["dark"])
+        with pytest.raises(ValueError):
+            render_glass_panel(120, -1, THEMES["dark"])
+
+    def test_oversized_radius_does_not_crash(self):
+        panel = render_glass_panel(40, 30, THEMES["dark"], radius=1000)
+        assert panel.shape == (30, 40, 4)
+
+    def test_center_alpha_matches_theme_fill_alpha(self):
+        theme = THEMES["dark"]
+        panel = render_glass_panel(120, 80, theme, border_width=0)
+        center_alpha = panel[40, 60, 3]
+        expected = round(theme.panel_fill_alpha * 255)
+        assert abs(int(center_alpha) - expected) <= 1
+
+    def test_corner_alpha_is_near_zero(self):
+        panel = render_glass_panel(120, 80, THEMES["dark"], radius=20)
+        assert panel[0, 0, 3] < 20
+
+    def test_top_is_lighter_than_bottom(self):
+        panel = render_glass_panel(100, 100, THEMES["dark"], border_width=0)
+        top_pixel = panel[10, 50, :3].astype(int).sum()
+        bottom_pixel = panel[90, 50, :3].astype(int).sum()
+        assert top_pixel > bottom_pixel
+
+    def test_no_border_when_border_width_zero(self):
+        theme = THEMES["dark"]
+        panel = render_glass_panel(100, 100, theme, border_width=0)
+        # near-edge pixel (but still inside the rounded area) should have the
+        # same alpha as the base fill, not the boosted "always visible" border alpha
+        edge_alpha = panel[50, 2, 3]
+        expected = round(theme.panel_fill_alpha * 255)
+        assert abs(int(edge_alpha) - expected) <= 5
+
+    def test_border_present_changes_edge_color(self):
+        theme = THEMES["neon"]  # magenta border, strongly distinct from the dark fill
+        with_border = render_glass_panel(100, 100, theme, border_width=3)
+        without_border = render_glass_panel(100, 100, theme, border_width=0)
+        edge_with = with_border[50, 2, :3].astype(int)
+        edge_without = without_border[50, 2, :3].astype(int)
+        assert not np.array_equal(edge_with, edge_without)
+
+
+class TestRenderPanelShadow:
+    def test_output_is_larger_than_panel_due_to_blur_margin(self):
+        bgra, _ = render_panel_shadow(100, 60, THEMES["dark"], blur_radius=10)
+        assert bgra.shape[0] > 60
+        assert bgra.shape[1] > 100
+
+    def test_offset_accounts_for_margin(self):
+        _, (dx, dy) = render_panel_shadow(100, 60, THEMES["dark"], blur_radius=10, offset=(0, 6))
+        assert dx < 0  # shifted left/up to compensate for the blur margin
+        assert dy < 0
+
+    def test_rejects_invalid_strength(self):
+        with pytest.raises(ValueError):
+            render_panel_shadow(100, 60, THEMES["dark"], strength=1.5)
+
+    def test_zero_strength_is_fully_transparent(self):
+        bgra, _ = render_panel_shadow(100, 60, THEMES["dark"], strength=0.0)
+        assert bgra[:, :, 3].max() == 0
+
+    def test_positive_strength_has_visible_alpha_near_center(self):
+        bgra, _ = render_panel_shadow(100, 60, THEMES["dark"], strength=0.5)
+        cy, cx = bgra.shape[0] // 2, bgra.shape[1] // 2
+        assert bgra[cy, cx, 3] > 0
+
+    def test_shadow_is_tinted_with_theme_shadow_color(self):
+        theme = THEMES["dark"]
+        bgra, _ = render_panel_shadow(100, 60, theme, strength=1.0)
+        cy, cx = bgra.shape[0] // 2, bgra.shape[1] // 2
+        np.testing.assert_array_equal(bgra[cy, cx, :3], theme.shadow)
+
+    def test_zero_blur_radius_does_not_crash(self):
+        bgra, _ = render_panel_shadow(100, 60, THEMES["dark"], blur_radius=0)
+        assert bgra.shape[0] >= 60
+
+
+class TestDrawGlassPanel:
+    def test_does_not_mutate_input(self):
+        frame = make_frame(300, 200, color=(90, 90, 90))
+        original = frame.copy()
+        draw_glass_panel(frame, 20, 20, 100, 80, THEMES["dark"])
+        np.testing.assert_array_equal(frame, original)
+
+    def test_output_same_shape_as_input(self):
+        frame = make_frame(300, 200)
+        out = draw_glass_panel(frame, 20, 20, 100, 80, THEMES["dark"])
+        assert out.shape == frame.shape
+
+    def test_panel_region_actually_changes_pixels(self):
+        frame = make_frame(300, 200, color=(90, 90, 90))
+        out = draw_glass_panel(frame, 20, 20, 100, 80, THEMES["dark"])
+        assert not np.array_equal(out[60, 70], frame[60, 70])
+
+    def test_far_from_panel_is_unaffected(self):
+        frame = make_frame(300, 200, color=(90, 90, 90))
+        out = draw_glass_panel(frame, 20, 20, 100, 80, THEMES["dark"], shadow_blur=5)
+        np.testing.assert_array_equal(out[190, 290], frame[190, 290])
+
+    @pytest.mark.parametrize("x,y", [(-50, -50), (280, 180), (-10, 90), (290, -10)])
+    def test_panel_off_every_edge_does_not_crash(self, x, y):
+        frame = make_frame(300, 200)
+        out = draw_glass_panel(frame, x, y, 100, 80, THEMES["dark"])
+        assert out.shape == frame.shape
+
+    def test_works_for_every_theme(self):
+        frame = make_frame(300, 200)
+        for theme in THEMES.values():
+            out = draw_glass_panel(frame, 20, 20, 100, 80, theme)
+            assert out.shape == frame.shape
+
+
+# --------------------------------------------------------------------------
+# vignette
+# --------------------------------------------------------------------------
+
+class TestApplyVignette:
+    def test_rejects_out_of_range_strength(self):
+        frame = make_frame(100, 100)
+        with pytest.raises(ValueError):
+            apply_vignette(frame, -0.1)
+        with pytest.raises(ValueError):
+            apply_vignette(frame, 1.1)
+
+    def test_rejects_non_3d_frame(self):
+        with pytest.raises(ValueError):
+            apply_vignette(np.zeros((10, 10), dtype=np.uint8), 0.5)
+
+    def test_does_not_mutate_input(self):
+        frame = make_frame(100, 100, color=(150, 150, 150))
+        original = frame.copy()
+        apply_vignette(frame, 0.7)
+        np.testing.assert_array_equal(frame, original)
+
+    def test_zero_strength_is_unchanged_copy(self):
+        frame = make_frame(100, 100, color=(150, 150, 150))
+        out = apply_vignette(frame, 0.0)
+        np.testing.assert_array_equal(out, frame)
+        assert out is not frame
+
+    def test_center_pixel_barely_changes(self):
+        frame = make_frame(100, 100, color=(150, 150, 150))
+        out = apply_vignette(frame, 1.0)
+        center = out[50, 50]
+        assert abs(int(center[0]) - 150) <= 2
+
+    def test_corner_darker_than_center(self):
+        frame = make_frame(100, 100, color=(150, 150, 150))
+        out = apply_vignette(frame, 0.8)
+        corner = int(out[0, 0, 0])
+        center = int(out[50, 50, 0])
+        assert corner < center
+
+    def test_stronger_vignette_darkens_corner_more(self):
+        frame = make_frame(100, 100, color=(150, 150, 150))
+        mild = apply_vignette(frame, 0.3)
+        strong = apply_vignette(frame, 0.9)
+        assert int(strong[0, 0, 0]) < int(mild[0, 0, 0])
+
+    def test_full_strength_corner_is_near_black(self):
+        frame = make_frame(100, 100, color=(200, 200, 200))
+        out = apply_vignette(frame, 1.0)
+        assert int(out[0, 0, 0]) < 20
+
+    def test_output_shape_and_dtype_preserved(self):
+        frame = make_frame(120, 80)
+        out = apply_vignette(frame, 0.5)
+        assert out.shape == frame.shape
+        assert out.dtype == frame.dtype
+
+
+class TestApplyThemeVignette:
+    def test_matches_direct_call_with_theme_strength(self):
+        frame = make_frame(100, 100, color=(150, 150, 150))
+        theme = THEMES["neon"]
+        via_theme = apply_theme_vignette(frame, theme)
+        direct = apply_vignette(frame, theme.vignette_strength)
+        np.testing.assert_array_equal(via_theme, direct)
+
+    def test_works_for_every_theme(self):
+        frame = make_frame(100, 100)
+        for theme in THEMES.values():
+            out = apply_theme_vignette(frame, theme)
+            assert out.shape == frame.shape
