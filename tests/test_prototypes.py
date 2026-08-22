@@ -237,6 +237,84 @@ class TestBestMatch:
 
 
 # --------------------------------------------------------------------------
+# PrototypeStore — all_similarities (feeds the similarity-meter HUD)
+# --------------------------------------------------------------------------
+
+class TestAllSimilarities:
+    def _two_class_store(self):
+        store = PrototypeStore()
+        base_mug = unit_vector(100, dim=16)
+        base_bottle = unit_vector(200, dim=16)
+        for i in range(5):
+            store.add_example("mug", jittered(base_mug, 0.05, seed=i))
+        for i in range(5):
+            store.add_example("bottle", jittered(base_bottle, 0.05, seed=100 + i))
+        return store, base_mug, base_bottle
+
+    def test_empty_store_returns_empty_dict(self):
+        store = PrototypeStore()
+        assert store.all_similarities(unit_vector(1)) == {}
+
+    def test_returns_one_entry_per_class(self):
+        store, base_mug, base_bottle = self._two_class_store()
+        result = store.all_similarities(unit_vector(999, dim=16))
+        assert set(result.keys()) == {"mug", "bottle"}
+
+    def test_values_are_plain_floats(self):
+        store, _, _ = self._two_class_store()
+        result = store.all_similarities(unit_vector(999, dim=16))
+        for value in result.values():
+            assert isinstance(value, float)
+
+    def test_matching_class_scores_higher_than_the_other(self):
+        store, base_mug, base_bottle = self._two_class_store()
+        query = jittered(base_mug, 0.05, seed=999)
+        result = store.all_similarities(query, mode="mean")
+        assert result["mug"] > result["bottle"]
+
+    def test_mean_mode_agrees_with_best_match_winner(self):
+        store, base_mug, _ = self._two_class_store()
+        query = jittered(base_mug, 0.05, seed=999)
+        all_sims = store.all_similarities(query, mode="mean")
+        best = store.best_match(query, threshold=0.5, mode="mean")
+        winner = max(all_sims, key=all_sims.get)
+        assert winner == best.label
+        assert all_sims[winner] == pytest.approx(best.similarity, abs=1e-6)
+
+    def test_max_mode_agrees_with_best_match_winner(self):
+        store, base_mug, _ = self._two_class_store()
+        query = jittered(base_mug, 0.05, seed=999)
+        all_sims = store.all_similarities(query, mode="max")
+        best = store.best_match(query, threshold=0.5, mode="max")
+        winner = max(all_sims, key=all_sims.get)
+        assert winner == best.label
+        assert all_sims[winner] == pytest.approx(best.similarity, abs=1e-6)
+
+    def test_max_mode_score_is_at_least_mean_mode_score(self):
+        # max mode picks the single best example per class, which can only
+        # be >= that class's own centroid similarity.
+        store, base_mug, _ = self._two_class_store()
+        query = jittered(base_mug, 0.05, seed=999)
+        mean_sims = store.all_similarities(query, mode="mean")
+        max_sims = store.all_similarities(query, mode="max")
+        for label in mean_sims:
+            assert max_sims[label] >= mean_sims[label] - 1e-6
+
+    def test_single_class_store(self):
+        store = PrototypeStore()
+        v = unit_vector(1, dim=8)
+        store.add_example("mug", v)
+        result = store.all_similarities(v)
+        assert list(result.keys()) == ["mug"]
+        assert result["mug"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_invalid_mode_raises(self):
+        store, _, _ = self._two_class_store()
+        with pytest.raises(ValueError):
+            store.all_similarities(unit_vector(1, dim=16), mode="bogus")
+
+
+# --------------------------------------------------------------------------
 # PrototypeStore — save/load persistence
 # --------------------------------------------------------------------------
 

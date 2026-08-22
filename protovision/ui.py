@@ -5,8 +5,7 @@ Reuses the proven design language from VisionPuzzle Studio and SignSenseLive
 (Poppins typography via PIL with glyph caching, glass-panel HUD, theme
 switching, cinematic vignette, ambient audio) but with its own signature look
 — this project is a research/analysis tool, not a game or a sign-language
-aid, so the visual identity leans into that (see the similarity-meter HUD,
-still to come).
+aid, so the visual identity leans into that.
 
 Built incrementally, same as the rest of this project. This slice covers:
   1. Typography — PIL-rendered Poppins glyphs, cached per (weight, size,
@@ -16,19 +15,23 @@ Built incrementally, same as the rest of this project. This slice covers:
   3. Glass-panel HUD — rounded rect, vertical gradient fill, translucent
      alpha, thin border, soft blurred drop shadow — and a cinematic
      radial vignette, both themed off the same Theme dataclass.
+  4. Similarity meter — the signature visual: a horizontal bar per known
+     class showing its live cosine similarity, so the actual ML decision
+     is visible rather than just the winning label. Distinct from both
+     prior projects' hand-visualization approaches, and fits this
+     project's identity as a data/research tool rather than a game or a
+     sign-language aid.
 
-The similarity-meter signature visual and ambient audio/SFX are separate,
-later slices — this file will grow to hold them too, but they're not here
-yet. Panel/vignette rendering isn't wired into enroll.py/live.py's
-render_preview() yet either — that wiring happens once the similarity meter
-exists and there's an actual HUD layout to assemble.
+Ambient audio/SFX is a separate, later slice. Panel/vignette/meter
+rendering isn't wired into enroll.py/live.py's render_preview() yet — that
+assembly happens as its own step once every HUD piece exists.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -600,3 +603,165 @@ def apply_vignette(frame: np.ndarray, strength: float) -> np.ndarray:
 def apply_theme_vignette(frame: np.ndarray, theme: Theme) -> np.ndarray:
     """Convenience wrapper: apply_vignette using the theme's own configured strength."""
     return apply_vignette(frame, theme.vignette_strength)
+
+
+# ==========================================================================
+# Similarity meter — the signature visual
+# ==========================================================================
+#
+# A horizontal bar per known class showing its live cosine similarity to
+# the current frame — from prototypes.py's all_similarities(), not just
+# best_match()'s single winner. This is the whole point of the design: the
+# actual ML decision is visible on screen, not just a final label, which
+# is what makes this project read as a research/analysis tool rather than
+# a game or an assistive aid (VisionPuzzle's rainbow game skeleton and
+# SignSense's neural-scan hand mesh both show *input*; this shows the
+# *decision*).
+#
+# Built from the same primitives as everything else in this file: pill
+# shapes reuse _rounded_rect_mask (already built for glass panels), and
+# rows are composited with the same _blit_bgra used for text and panels.
+#
+# Row ORDER is the caller's choice, deliberately: this function draws
+# `entries` in the order given rather than silently sorting by score.
+# Sorting by similarity descending puts the best match on top, which reads
+# well, but it also means two classes with close, fluctuating scores can
+# swap rows from frame to frame — visually jittery for a live meter. A
+# stable, caller-chosen order (e.g. alphabetical, or "insertion order from
+# enrollment") avoids that; ranking by score is still easy to do by sorting
+# `entries` before calling this, if that's what a given screen wants.
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _solid_rounded_rect(width: int, height: int, radius: int, color: BGRColor, alpha: float) -> np.ndarray:
+    """A flat-color, anti-aliased rounded-rect BGRA patch — the same shape
+    machinery as render_glass_panel's fill, minus the gradient/border, used
+    here for meter bar tracks and fills (a 'pill' shape when radius ==
+    height // 2)."""
+    width, height = max(1, width), max(1, height)
+    radius = max(0, min(radius, min(width, height) // 2))
+    mask = np.asarray(_rounded_rect_mask(width, height, radius), dtype=np.float32) / 255.0
+    bgr = np.empty((height, width, 3), dtype=np.float32)
+    bgr[:] = color
+    a = mask * _clamp01(alpha)
+    return np.dstack([bgr, a * 255.0]).astype(np.uint8)
+
+
+def _truncate_to_width(cache: GlyphCache, text: str, weight: str, size: int, max_width: int) -> str:
+    """Shorten `text` with a trailing ellipsis so it fits in `max_width`
+    pixels — protects the layout against arbitrary user-entered class
+    labels running into the bar rather than assuming short names."""
+    width, _ = cache.measure_text(text, weight, size)
+    if width <= max_width or not text:
+        return text
+    ellipsis = "…"
+    for cut in range(len(text) - 1, 0, -1):
+        candidate = text[:cut] + ellipsis
+        w, _ = cache.measure_text(candidate, weight, size)
+        if w <= max_width:
+            return candidate
+    return ellipsis
+
+
+def similarity_meter_height(num_entries: int, bar_height: int = 14, row_gap: int = 10) -> int:
+    """Total pixel height `draw_similarity_meter` will occupy for
+    `num_entries` rows — lets a caller (e.g. a future HUD-assembly step
+    sizing a glass panel around the meter) know the height up front without
+    duplicating the row-spacing arithmetic."""
+    if num_entries <= 0:
+        return 0
+    return num_entries * bar_height + (num_entries - 1) * row_gap
+
+
+def draw_similarity_meter(
+    frame: np.ndarray,
+    x: int,
+    y: int,
+    entries: Sequence[Tuple[str, float]],
+    theme: Theme,
+    glyph_cache: GlyphCache,
+    threshold: float = 0.5,
+    width: int = 220,
+    bar_height: int = 14,
+    row_gap: int = 10,
+    label_width: int = 70,
+    value_width: int = 44,
+    font_size: int = 14,
+    font_weight: str = "regular",
+    min_similarity: float = -1.0,
+    max_similarity: float = 1.0,
+    track_alpha: float = 0.35,
+    fill_alpha: float = 0.9,
+) -> np.ndarray:
+    """
+    Draw one row per (label, similarity) entry: the class name, a
+    horizontal bar-track with a filled bar proportional to similarity, and
+    the numeric value — ProtoVision's signature visual.
+
+    Row layout, left to right: [label, fixed label_width] [bar track,
+    fills the rest] [value text, fixed value_width]. (x, y) is the
+    top-left of the whole stack; rows are drawn top to bottom in the order
+    `entries` is given (see the module-level note above on why this
+    function doesn't sort them itself).
+
+    Bars for entries at/above `threshold` use theme.accent_known; bars
+    below it use theme.accent_unknown — so at a glance you can see not
+    just which class is winning, but whether anything is actually
+    confident. `similarity` values are expected in cosine-similarity range
+    (roughly [-1, 1]; that's the default min/max_similarity mapping), but
+    values outside that range are clamped rather than producing a
+    negative-width or overflowing bar.
+
+    Returns a COPY of `frame` — never mutates the input, same convention as
+    draw_text/draw_glass_panel/draw_guide_box.
+    """
+    if bar_height <= 0:
+        raise ValueError(f"bar_height must be positive, got {bar_height}")
+    if width <= label_width + value_width:
+        raise ValueError(
+            f"width ({width}) must be greater than label_width + value_width "
+            f"({label_width + value_width}) or there's no room left for the bar"
+        )
+    if max_similarity <= min_similarity:
+        raise ValueError("max_similarity must be greater than min_similarity")
+
+    out = frame.copy()
+    bar_x = x + label_width
+    bar_width = width - label_width - value_width
+    value_range = max_similarity - min_similarity
+
+    row_y = y
+    for label, similarity in entries:
+        is_known = similarity >= threshold
+        accent = theme.accent_known if is_known else theme.accent_unknown
+
+        display_label = _truncate_to_width(glyph_cache, label, font_weight, font_size, label_width - 4)
+        out = draw_text(
+            out, glyph_cache, display_label, x, row_y,
+            weight=font_weight, size=font_size, color=theme.text_primary,
+        )
+
+        track_bgra = _solid_rounded_rect(
+            bar_width, bar_height, radius=bar_height // 2, color=theme.text_secondary, alpha=track_alpha
+        )
+        _blit_bgra(out, track_bgra, bar_x, row_y)
+
+        frac = _clamp01((similarity - min_similarity) / value_range)
+        fill_w = int(round(bar_width * frac))
+        if fill_w > 0:
+            fill_bgra = _solid_rounded_rect(
+                fill_w, bar_height, radius=bar_height // 2, color=accent, alpha=fill_alpha
+            )
+            _blit_bgra(out, fill_bgra, bar_x, row_y)
+
+        value_text = f"{similarity:.2f}"
+        out = draw_text(
+            out, glyph_cache, value_text, bar_x + bar_width + 6, row_y,
+            weight=font_weight, size=font_size, color=theme.text_secondary,
+        )
+
+        row_y += bar_height + row_gap
+
+    return out

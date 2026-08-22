@@ -32,11 +32,16 @@ from protovision.ui import (
     draw_glass_panel,
     apply_vignette,
     apply_theme_vignette,
+    similarity_meter_height,
+    draw_similarity_meter,
     _lighten,
     _darken,
     _vertical_gradient,
     _rounded_rect_mask,
     _rounded_rect_border_mask,
+    _solid_rounded_rect,
+    _truncate_to_width,
+    _clamp01,
 )
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
@@ -49,6 +54,15 @@ def cache() -> GlyphCache:
 
 def make_frame(w=200, h=60, color=(20, 20, 30)) -> np.ndarray:
     return np.full((h, w, 3), color, dtype=np.uint8)
+
+
+def _count_pixels_near_color(pixels: np.ndarray, target_color, tol: int = 40) -> int:
+    """How many pixels (in an (N, 3) or (H, W, 3) slice) are within `tol` of
+    `target_color` on every channel — used to count how much of a bar is
+    actually filled with the accent color, as opposed to just 'differs from
+    background' (which the track alone also does, regardless of fill length)."""
+    diff = np.abs(pixels.astype(int) - np.array(target_color, dtype=int))
+    return int((diff.max(axis=-1) < tol).sum())
 
 
 # --------------------------------------------------------------------------
@@ -631,3 +645,261 @@ class TestApplyThemeVignette:
         for theme in THEMES.values():
             out = apply_theme_vignette(frame, theme)
             assert out.shape == frame.shape
+
+
+# --------------------------------------------------------------------------
+# similarity meter — low-level helpers
+# --------------------------------------------------------------------------
+
+class TestClamp01:
+    def test_within_range_unchanged(self):
+        assert _clamp01(0.5) == 0.5
+
+    def test_below_zero_clamps_to_zero(self):
+        assert _clamp01(-0.3) == 0.0
+
+    def test_above_one_clamps_to_one(self):
+        assert _clamp01(1.7) == 1.0
+
+    def test_boundaries(self):
+        assert _clamp01(0.0) == 0.0
+        assert _clamp01(1.0) == 1.0
+
+
+class TestSolidRoundedRect:
+    def test_output_shape(self):
+        patch = _solid_rounded_rect(50, 14, radius=7, color=(0, 255, 0), alpha=0.9)
+        assert patch.shape == (14, 50, 4)
+
+    def test_center_color_matches_requested_color(self):
+        patch = _solid_rounded_rect(50, 14, radius=7, color=(10, 20, 30), alpha=1.0)
+        np.testing.assert_array_equal(patch[7, 25, :3], [10, 20, 30])
+
+    def test_center_alpha_matches_requested_alpha(self):
+        patch = _solid_rounded_rect(50, 14, radius=7, color=(10, 20, 30), alpha=0.6)
+        assert abs(int(patch[7, 25, 3]) - round(0.6 * 255)) <= 1
+
+    def test_corner_is_mostly_transparent(self):
+        patch = _solid_rounded_rect(50, 14, radius=7, color=(10, 20, 30), alpha=1.0)
+        assert patch[0, 0, 3] < 50
+
+    def test_alpha_above_one_is_clamped(self):
+        patch = _solid_rounded_rect(20, 10, radius=5, color=(1, 1, 1), alpha=5.0)
+        assert patch[5, 10, 3] == 255
+
+    def test_zero_width_or_height_does_not_crash(self):
+        patch = _solid_rounded_rect(0, 14, radius=7, color=(1, 1, 1), alpha=1.0)
+        assert patch.shape[1] >= 1  # clamped to at least 1px, not zero/negative
+
+
+class TestTruncateToWidth:
+    def test_short_text_is_unchanged(self, cache):
+        result = _truncate_to_width(cache, "mug", "regular", 16, max_width=200)
+        assert result == "mug"
+
+    def test_empty_string_is_unchanged(self, cache):
+        assert _truncate_to_width(cache, "", "regular", 16, max_width=200) == ""
+
+    def test_long_text_is_shortened(self, cache):
+        long_label = "a_very_long_class_name_indeed"
+        result = _truncate_to_width(cache, long_label, "regular", 16, max_width=60)
+        assert len(result) < len(long_label)
+
+    def test_truncated_text_ends_with_ellipsis(self, cache):
+        long_label = "a_very_long_class_name_indeed"
+        result = _truncate_to_width(cache, long_label, "regular", 16, max_width=60)
+        assert result.endswith("…")
+
+    def test_truncated_text_actually_fits(self, cache):
+        long_label = "a_very_long_class_name_indeed"
+        max_width = 60
+        result = _truncate_to_width(cache, long_label, "regular", 16, max_width=max_width)
+        width, _ = cache.measure_text(result, "regular", 16)
+        assert width <= max_width
+
+    def test_extremely_narrow_width_falls_back_to_bare_ellipsis(self, cache):
+        result = _truncate_to_width(cache, "mug", "regular", 16, max_width=1)
+        assert result == "…"
+
+
+# --------------------------------------------------------------------------
+# similarity meter — layout helper
+# --------------------------------------------------------------------------
+
+class TestSimilarityMeterHeight:
+    def test_zero_entries_is_zero_height(self):
+        assert similarity_meter_height(0) == 0
+
+    def test_single_entry_equals_bar_height(self):
+        assert similarity_meter_height(1, bar_height=14, row_gap=10) == 14
+
+    def test_multiple_entries_include_gaps_between_not_after(self):
+        # 3 rows, 2 gaps between them, no trailing gap after the last row
+        assert similarity_meter_height(3, bar_height=14, row_gap=10) == 3 * 14 + 2 * 10
+
+    def test_negative_count_treated_as_zero(self):
+        assert similarity_meter_height(-5) == 0
+
+
+# --------------------------------------------------------------------------
+# similarity meter — full render
+# --------------------------------------------------------------------------
+
+class TestDrawSimilarityMeter:
+    def _entries(self):
+        return [("mug", 0.87), ("bottle", 0.42), ("keys", -0.10)]
+
+    def test_does_not_mutate_input(self, cache):
+        frame = make_frame(300, 200, color=(90, 90, 90))
+        original = frame.copy()
+        draw_similarity_meter(frame, 10, 10, self._entries(), THEMES["dark"], cache)
+        np.testing.assert_array_equal(frame, original)
+
+    def test_output_same_shape_as_input(self, cache):
+        frame = make_frame(300, 200)
+        out = draw_similarity_meter(frame, 10, 10, self._entries(), THEMES["dark"], cache)
+        assert out.shape == frame.shape
+
+    def test_empty_entries_leaves_frame_unchanged(self, cache):
+        frame = make_frame(300, 200)
+        out = draw_similarity_meter(frame, 10, 10, [], THEMES["dark"], cache)
+        np.testing.assert_array_equal(out, frame)
+
+    def test_drawing_actually_changes_pixels(self, cache):
+        frame = make_frame(300, 200, color=(90, 90, 90))
+        out = draw_similarity_meter(frame, 10, 10, self._entries(), THEMES["dark"], cache)
+        assert not np.array_equal(out, frame)
+
+    def test_rejects_non_positive_bar_height(self, cache):
+        frame = make_frame(300, 200)
+        with pytest.raises(ValueError):
+            draw_similarity_meter(frame, 10, 10, self._entries(), THEMES["dark"], cache, bar_height=0)
+
+    def test_rejects_width_too_small_for_label_and_value(self, cache):
+        frame = make_frame(300, 200)
+        with pytest.raises(ValueError):
+            draw_similarity_meter(
+                frame, 10, 10, self._entries(), THEMES["dark"], cache,
+                width=50, label_width=70, value_width=44,
+            )
+
+    def test_rejects_invalid_similarity_range(self, cache):
+        frame = make_frame(300, 200)
+        with pytest.raises(ValueError):
+            draw_similarity_meter(
+                frame, 10, 10, self._entries(), THEMES["dark"], cache,
+                min_similarity=0.5, max_similarity=0.5,
+            )
+
+    def test_known_bar_uses_accent_known_color(self, cache):
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200, color=(30, 30, 30))
+        out = draw_similarity_meter(
+            frame, 10, 10, [("mug", 0.9)], theme, cache,
+            threshold=0.5, width=220, bar_height=14,
+        )
+        # sample a pixel solidly inside the filled bar's vertical center,
+        # a few px in from the bar's left edge (past the label column)
+        bar_x = 10 + 70 + 4
+        bar_y = 10 + 7
+        pixel = out[bar_y, bar_x, :3].astype(int)
+        target = np.array(theme.accent_known, dtype=int)
+        assert np.abs(pixel - target).max() < 40  # allow for anti-aliasing/track blending
+
+    def test_unknown_bar_uses_accent_unknown_color(self, cache):
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200, color=(30, 30, 30))
+        out = draw_similarity_meter(
+            frame, 10, 10, [("mug", 0.1)], theme, cache,
+            threshold=0.5, width=220, bar_height=14,
+        )
+        bar_x = 10 + 70 + 4
+        bar_y = 10 + 7
+        pixel = out[bar_y, bar_x, :3].astype(int)
+        target = np.array(theme.accent_unknown, dtype=int)
+        assert np.abs(pixel - target).max() < 40
+
+    def test_higher_similarity_fills_more_of_the_bar(self, cache):
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200, color=(30, 30, 30))
+
+        low = draw_similarity_meter(frame, 10, 10, [("x", 0.1)], theme, cache, width=220, bar_height=14)
+        high = draw_similarity_meter(frame, 10, 10, [("x", 0.9)], theme, cache, width=220, bar_height=14)
+
+        bar_y = 10 + 7
+        bar_x0 = 10 + 70
+        bar_x1 = 10 + 220 - 44
+        # The track (background pill) spans the full bar width regardless of
+        # fill amount, so "differs from background" alone can't distinguish
+        # a short fill from a long one — both bars change the same pixels.
+        # Count pixels that match the ACCENT (fill) color specifically instead.
+        low_fill_px = _count_pixels_near_color(low[bar_y, bar_x0:bar_x1], theme.accent_known)
+        high_fill_px = _count_pixels_near_color(high[bar_y, bar_x0:bar_x1], theme.accent_known)
+        assert high_fill_px > low_fill_px
+
+    def test_negative_similarity_still_shows_partial_bar(self, cache):
+        # with the default min/max of [-1, 1], a similarity of -0.5 should
+        # map to 25% fill, not an empty/invisible bar.
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200, color=(30, 30, 30))
+        out = draw_similarity_meter(frame, 10, 10, [("x", -0.5)], theme, cache, width=220, bar_height=14)
+        bar_y, bar_x0 = 10 + 7, 10 + 70
+        # a pixel near the very start of the track should differ from background
+        # (fill or at least track is drawn) — this just confirms SOME bar renders,
+        # not that it's fully empty due to an off-by-one on the negative range.
+        assert not np.array_equal(out[bar_y, bar_x0 + 2], frame[bar_y, bar_x0 + 2])
+
+    def test_long_label_is_truncated_not_overlapping_bar(self, cache):
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200)
+        long_label = "a_very_long_class_name_that_would_otherwise_overflow"
+        # should not raise, and should produce a normally-shaped frame —
+        # the real protection (does it actually fit) is covered by
+        # TestTruncateToWidth; this just confirms the integration doesn't blow up.
+        out = draw_similarity_meter(frame, 10, 10, [(long_label, 0.5)], theme, cache, width=220, label_width=70)
+        assert out.shape == frame.shape
+
+    def test_multiple_rows_are_stacked_vertically(self, cache):
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200, color=(30, 30, 30))
+        out = draw_similarity_meter(frame, 10, 10, self._entries(), theme, cache, bar_height=14, row_gap=10)
+        # first row's bar band and second row's bar band should be at
+        # different y positions with actual pixel changes in each
+        row0_y = 10 + 7
+        row1_y = 10 + 14 + 10 + 7
+        bar_x = 10 + 70 + 4
+        assert not np.array_equal(out[row0_y, bar_x], frame[row0_y, bar_x])
+        assert not np.array_equal(out[row1_y, bar_x], frame[row1_y, bar_x])
+
+    @pytest.mark.parametrize("x,y", [(-50, -50), (250, 150), (-10, 90)])
+    def test_meter_off_every_edge_does_not_crash(self, cache, x, y):
+        frame = make_frame(300, 200)
+        out = draw_similarity_meter(frame, x, y, self._entries(), THEMES["dark"], cache, width=180)
+        assert out.shape == frame.shape
+
+    def test_works_for_every_theme(self, cache):
+        frame = make_frame(300, 200)
+        for theme in THEMES.values():
+            out = draw_similarity_meter(frame, 10, 10, self._entries(), theme, cache)
+            assert out.shape == frame.shape
+
+    def test_row_order_matches_entries_order_not_sorted(self, cache):
+        """Confirms rows are drawn in caller-given order, not auto-sorted by
+        score — an intentional design choice (see module docstring)."""
+        theme = THEMES["dark"]
+        frame = make_frame(300, 200, color=(30, 30, 30))
+        # low similarity first, high similarity second — if this function
+        # silently sorted, the bigger bar would end up on row 0 instead.
+        ascending = [("low", 0.1), ("high", 0.9)]
+        out = draw_similarity_meter(frame, 10, 10, ascending, theme, cache, width=220, bar_height=14, row_gap=10)
+
+        row0_y = 10 + 7
+        row1_y = 10 + 14 + 10 + 7
+        bar_x0 = 10 + 70
+        bar_x1 = 10 + 220 - 44
+
+        row0_fill_px = _count_pixels_near_color(out[row0_y, bar_x0:bar_x1], theme.accent_unknown)
+        row1_fill_px = _count_pixels_near_color(out[row1_y, bar_x0:bar_x1], theme.accent_known)
+
+        # row 0 ("low", 0.1) should have a SMALLER filled region than row 1 ("high", 0.9)
+        assert row0_fill_px < row1_fill_px

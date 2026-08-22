@@ -92,7 +92,7 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **274/274 passing** |
+| 🧪 Strong test coverage | Current test suite reports **321/321 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
@@ -109,7 +109,7 @@ Example Images
 | 1 | **4** | CLI — `main.py enroll` / `main.py live` / `main.py list` | ✅ Complete & tested · real enroll/live runs need real hardware + weights |
 | 2 | **1** | `ui.py` — Poppins typography (glyph cache) + theme palettes | ✅ Complete & tested |
 | 2 | **2** | `ui.py` — glass-panel HUD + cinematic vignette | ✅ Complete & tested |
-| 2 | **3** | `ui.py` — similarity-meter signature visual | ⏳ Not started |
+| 2 | **3** | `ui.py` — similarity-meter signature visual | ✅ Complete & tested |
 | 2 | **4** | Ambient audio + SFX (fail-soft) | ⏳ Not started |
 
 ---
@@ -142,10 +142,10 @@ ProtoVision/
 │   ├── capture.py      # Camera wrapper + guide-box geometry/crop
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
 │   ├── live.py         # Live recognition (frame-skip inference + best_match)
-│   └── ui.py           # Visual design system: typography, themes, glass panels, vignette
+│   └── ui.py            # Visual design system: typography, themes, glass panels, vignette
 ├── assets/
-│   └── fonts/          # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
-├── tests/              # Automated tests (274, all passing)
+│   └── fonts/           # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
+├── tests/              # Automated tests (321, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -292,6 +292,39 @@ reason to fake it):
   anything that was numerically fine but visually wrong first — see design
   decision #8 below
 
+**`ui.py` similarity meter** — the signature visual: a horizontal bar per
+known class showing its live cosine similarity, so the actual ML decision is
+visible rather than just the winning label
+
+- `prototypes.py` grew a companion method for this, `all_similarities()` —
+  `best_match()` only ever returned the single winner, which isn't enough to
+  draw a bar per class. Tested for agreement with `best_match()` (the
+  highest-scoring label in `all_similarities()` is always the same label
+  `best_match()` returns, in both `mean` and `max` mode) plus its own edge
+  cases (empty store, single class)
+- Bar fill is verified by counting pixels that actually match the accent
+  color, not just "differs from the background" — the background track pill
+  also differs from the background at its full width regardless of fill
+  amount, so an early version of this test was accidentally passing for the
+  wrong reason (see design decision #10) until it was rewritten to check the
+  right thing
+- Confirmed a higher similarity produces measurably more filled pixels than
+  a lower one, that bars at/above `threshold` render in `theme.accent_known`
+  and below it in `theme.accent_unknown`, and that a similarity below zero
+  (a real possibility for cosine similarity, not just a theoretical one)
+  still shows a partial bar rather than an empty/invisible one
+- Long class-name labels are truncated with a real ellipsis glyph
+  (confirmed Poppins actually has one, rather than assuming) so they can't
+  run into the bar; truncation is tested both in isolation (does the
+  shortened text actually measure within the target width) and integrated
+  (does a very long label just work, not crash)
+- Row order: entries are drawn in the exact order passed in, not
+  auto-sorted by score — tested explicitly, since silently sorting would be
+  a very easy "helpful" bug to introduce later without noticing
+- Rendered and visually checked (all four themes, several labels including
+  a long one, edge-clipped positions) before the tests above were written,
+  same workflow as the panel work
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -309,7 +342,7 @@ The following require the real DINOv3 weights and/or actual hardware:
   own argument parsing and dispatch logic is tested (see above), but an
   actual end-to-end run needs the real backbone and a webcam, neither of
   which exist in this sandbox.
-- Whether the typography/panel/vignette system actually looks good composited
+- Whether the typography/panel/vignette/meter system actually looks good composited
   over a live, MOVING camera feed rather than a static synthetic test frame or
   a rendered-to-PNG snapshot — every theme was visually checked as a still
   image (see design decision #8), but motion, real lighting, and a real
@@ -355,8 +388,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-274 tests
-274 passed
+321 tests
+321 passed
 0 failed
 ```
 
@@ -476,6 +509,22 @@ was written.
 then alpha-composite it onto the frame with edge-clipping. One tested
 blending/clipping code path for the whole HUD, rather than a second bespoke
 one for panels that could drift out of sync or have its own edge-case bugs.
+The similarity meter's bars (`_solid_rounded_rect`) reuse the same
+`_rounded_rect_mask` the panels use, for the same reason.
+
+### 10. A test that passed for the wrong reason
+
+Worth writing down since it's a real mistake, not a hypothetical one: the
+first version of `test_higher_similarity_fills_more_of_the_bar` compared "how
+many pixels differ from the plain background" between a low-similarity and a
+high-similarity render, expecting the fuller bar to change more pixels. It
+failed — both counts came out identical. The bug was in the test, not the
+code: the background *track* (the dim pill every bar sits on, regardless of
+fill amount) already differs from the background across its *entire* width,
+so that metric was blind to how much of it was actually filled. Fixed by
+counting pixels that match the accent (fill) color specifically. Flagging
+this because a looser version of that test would have quietly passed either
+way and told me nothing.
 
 ---
 
@@ -493,7 +542,7 @@ one for panels that could drift out of sync or have its own edge-case bugs.
 - [x] Build Poppins typography system with glyph caching
 - [x] Build theme palette system (dark/light/neon/mono) with `T`-key cycling
 - [x] Build glass-panel HUD + cinematic vignette
-- [ ] Build the similarity-meter signature visual
+- [x] Build the similarity-meter signature visual
 - [ ] Add ambient audio + SFX (fail-soft)
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
@@ -511,10 +560,10 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (274/274 passing).
-**Phase 2 is underway:** typography, themes, glass-panel HUD, and the
-vignette are done and tested (including visual spot-checks, not just
-assertions); the similarity meter and audio are not built yet.
+camera-app logic, and CLI — are built and unit tested (321/321 passing).
+**Phase 2 is underway:** typography, themes, glass-panel HUD, vignette, and
+the similarity meter are done and tested (including visual spot-checks, not
+just assertions); only audio is left to build.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -524,15 +573,15 @@ What hasn't happened yet, and can't happen from this sandbox:
   end-to-end against a real webcam
 - No real-world semantic-quality check yet (same object → higher similarity
   than a different object, on actual photos rather than the mock model)
-- No check of the typography/panel/vignette system composited over a live,
+- No check of the typography/panel/vignette/meter system composited over a live,
   MOVING camera feed with a real background — every theme was rendered and
-  visually confirmed as a still PNG (see design decision #8), which is a real
-  check, just not the same one as watching it run live
+  visually confirmed as a still PNG (see design decisions #8 and #10), which
+  is a real check, just not the same one as watching it run live
 
 Once the Phase 1 hardware checks pass on your machine and the rest of Phase 2
-(the similarity-meter signature visual, ambient audio/SFX, and wiring the now-built
-panel/vignette into enroll.py/live.py's actual on-screen HUD) is built, this
-becomes the finished portfolio piece described in
+(ambient audio/SFX, and wiring the now-built panel/vignette/meter into
+enroll.py/live.py's actual on-screen HUD) is built, this becomes the
+finished portfolio piece described in
 the original brief.
 
 ---

@@ -152,6 +152,32 @@ class PrototypeStore:
             is_known=is_known,
         )
 
+    def all_similarities(self, embedding: np.ndarray, mode: str = "mean") -> Dict[str, float]:
+        """
+        Similarity between `embedding` and EVERY stored class, not just the
+        winner — the full picture the similarity-meter HUD visualizes.
+        `best_match()` throws away everything except the top score; this is
+        what feeds a bar per class instead of just the final label.
+
+        Same `mean`/`max` semantics as `best_match()`. Returns {} for an
+        empty store (nothing to compare against) rather than raising —
+        an empty meter is a valid, unremarkable state, not an error.
+        """
+        if mode not in ("mean", "max"):
+            raise ValueError(f"mode must be 'mean' or 'max', got {mode!r}")
+
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        results: Dict[str, float] = {}
+
+        if mode == "mean":
+            for label, proto in self.all_prototypes().items():
+                results[label] = cosine_similarity(embedding, proto)
+        else:  # mode == "max"
+            for label, examples in self._classes.items():
+                results[label] = max(cosine_similarity(embedding, ex) for ex in examples)
+
+        return results
+
     # -- persistence -----------------------------------------------------
 
     def save(self, path: PathLike) -> None:
