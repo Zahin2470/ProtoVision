@@ -28,12 +28,23 @@ import numpy as np
 from .backbone import DinoV3Backbone
 from .capture import Camera, GuideBox, compute_guide_box, crop_guide_box, draw_guide_box
 from .prototypes import PrototypeStore
+from .ui import GlyphCache, ThemeManager, apply_theme_vignette, draw_glass_panel, draw_text
 
 # Key codes — plain ASCII / cv2.waitKey(1) & 0xFF values, portable across platforms.
 KEY_CAPTURE = ord(" ")
 KEY_UNDO = ord("u")
 KEY_FINISH = 13  # Enter/Return
 KEY_CANCEL = 27  # Esc
+
+# HUD layout constants (see render_preview) — plain module-level numbers
+# rather than magic literals scattered through the method.
+_PANEL_X, _PANEL_Y = 20, 20
+_PANEL_WIDTH = 280
+_PANEL_PAD = 16
+_TITLE_SIZE = 20
+_PROGRESS_SIZE = 16
+_HINT_SIZE = 13
+_ROW_GAP = 6
 
 
 class EnrollState(Enum):
@@ -63,6 +74,8 @@ class EnrollApp:
         min_examples: int = 5,
         box_fraction: float = 0.5,
         camera: Optional[Camera] = None,
+        theme_manager: Optional[ThemeManager] = None,
+        glyph_cache: Optional[GlyphCache] = None,
     ):
         if not label or not label.strip():
             raise ValueError("label must be a non-empty string")
@@ -82,6 +95,12 @@ class EnrollApp:
         self._captured_embeddings: List[np.ndarray] = []
         self.state = EnrollState.CAPTURING
 
+        # Visual design system (Phase 2) — defaulted rather than required,
+        # so anything constructing an EnrollApp without caring about the
+        # HUD (most tests) doesn't need to know these exist.
+        self.theme_manager = theme_manager or ThemeManager()
+        self.glyph_cache = glyph_cache or GlyphCache()
+
         # The only line in this whole class that touches real hardware.
         self.camera = camera or Camera()
 
@@ -100,9 +119,56 @@ class EnrollApp:
         return compute_guide_box(frame.shape[1], frame.shape[0], self.box_fraction)
 
     def render_preview(self, frame: np.ndarray) -> np.ndarray:
-        """Frame with the guide box drawn on it, for on-screen display."""
+        """
+        Full on-screen HUD: guide box, a themed glass panel with the label
+        being enrolled, capture progress, and key hints, then a cinematic
+        vignette on top of everything.
+        """
         box = self.current_guide_box(frame)
-        return draw_guide_box(frame, box)
+        out = draw_guide_box(frame, box)
+
+        theme = self.theme_manager.theme
+        cache = self.glyph_cache
+
+        title_h = cache.line_height("medium", _TITLE_SIZE)
+        progress_h = cache.line_height("regular", _PROGRESS_SIZE)
+        hint_h = cache.line_height("regular", _HINT_SIZE)
+        panel_height = (
+            _PANEL_PAD * 2 + title_h + _ROW_GAP + progress_h + _ROW_GAP + hint_h + _ROW_GAP + hint_h
+        )
+
+        out = draw_glass_panel(out, _PANEL_X, _PANEL_Y, _PANEL_WIDTH, panel_height, theme, radius=16)
+
+        text_x = _PANEL_X + _PANEL_PAD
+        text_y = _PANEL_Y + _PANEL_PAD
+        out = draw_text(
+            out, cache, f"Enroll: {self.label}", text_x, text_y,
+            weight="medium", size=_TITLE_SIZE, color=theme.text_primary,
+        )
+
+        text_y += title_h + _ROW_GAP
+        captured, target = self.progress
+        progress_color = theme.accent_known if self.has_min_examples else theme.text_secondary
+        out = draw_text(
+            out, cache, f"{captured} / {target} captured", text_x, text_y,
+            weight="regular", size=_PROGRESS_SIZE, color=progress_color,
+        )
+
+        # Two lines, not one — the full hint string doesn't fit a
+        # reasonably-sized panel on one line (measured ~376px at this font
+        # size vs. this panel's ~248px of usable width).
+        text_y += progress_h + _ROW_GAP
+        out = draw_text(
+            out, cache, "SPACE capture   U undo   ENTER finish", text_x, text_y,
+            weight="regular", size=_HINT_SIZE, color=theme.text_secondary,
+        )
+        text_y += hint_h + _ROW_GAP
+        out = draw_text(
+            out, cache, "ESC cancel   T theme", text_x, text_y,
+            weight="regular", size=_HINT_SIZE, color=theme.text_secondary,
+        )
+
+        return apply_theme_vignette(out, theme)
 
     def capture_example(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -157,7 +223,13 @@ class EnrollApp:
         the right action. Kept as a single small dispatcher so the real
         camera loop in `run()` stays a thin, untestable shell around this
         testable method.
+
+        Theme cycling (`T`) is checked first and works regardless of
+        capture state — there's no reason switching themes should be
+        blocked just because the session already finished or was cancelled.
         """
+        if self.theme_manager.handle_key(key):
+            return
         if self.state != EnrollState.CAPTURING:
             return
         if key == KEY_CAPTURE:
@@ -177,7 +249,8 @@ class EnrollApp:
         """
         Blocking loop: show the webcam feed with the guide box overlay,
         SPACE to capture, 'u' to undo, Enter to finish early (if enough
-        examples), Esc to cancel. Not covered by tests — see module docstring.
+        examples), Esc to cancel, 'T' to cycle themes. Not covered by
+        tests — see module docstring.
         """
         import cv2  # local import: only needed for the real, non-testable loop
 

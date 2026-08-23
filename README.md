@@ -92,7 +92,7 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **321/321 passing** |
+| 🧪 Strong test coverage | Current test suite reports **342/342 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
@@ -110,7 +110,8 @@ Example Images
 | 2 | **1** | `ui.py` — Poppins typography (glyph cache) + theme palettes | ✅ Complete & tested |
 | 2 | **2** | `ui.py` — glass-panel HUD + cinematic vignette | ✅ Complete & tested |
 | 2 | **3** | `ui.py` — similarity-meter signature visual | ✅ Complete & tested |
-| 2 | **4** | Ambient audio + SFX (fail-soft) | ⏳ Not started |
+| 2 | **4** | HUD wired into `enroll.py`/`live.py` (panel + meter + vignette + theme key) | ✅ Complete & tested |
+| 2 | **5** | Ambient audio + SFX (fail-soft) | ⏳ Not started |
 
 ---
 
@@ -145,7 +146,7 @@ ProtoVision/
 │   └── ui.py            # Visual design system: typography, themes, glass panels, vignette
 ├── assets/
 │   └── fonts/           # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
-├── tests/              # Automated tests (321, all passing)
+├── tests/              # Automated tests (342, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -325,6 +326,38 @@ visible rather than just the winning label
   a long one, edge-clipped positions) before the tests above were written,
   same workflow as the panel work
 
+**HUD wired into `enroll.py`/`live.py`** — the panel, vignette, and meter
+stopped being tested-but-unused `ui.py` functions and became the apps'
+actual `render_preview()`
+
+- Caught a real layout bug before writing any tests for this piece: the
+  enroll screen's key-hint line measured 376px wide against a 260px panel —
+  badly overflowing. Rendered it, saw the overflow, fixed it (split into two
+  lines, widened the panel to 280px), re-rendered to confirm, then wrote
+  tests against the corrected layout
+- `live.py`'s `process_frame()` now caches `all_similarities()` alongside
+  `best_match()` on the same frame-skip schedule, so the meter and the
+  headline prediction can never disagree about which frame they're
+  describing — tested by confirming `last_similarities` is held (identical
+  object, not recomputed) on skipped frames, same proof-by-identity used for
+  the frame-skip logic itself back in Phase 1
+- `live.py`'s panel falls back to a distinct message for each of three
+  states — no classes enrolled, classes enrolled but no inference has run
+  yet, and an active result — tested separately so "empty store" and
+  "haven't inferred yet" can't be silently confused with each other
+- `T` (theme cycling) is handled in both apps: tested that it actually
+  changes `theme_manager.name`, that it works in `enroll.py` even after the
+  session is `DONE`/`CANCELLED` (there's no reason switching themes should
+  be gated behind capture state), and that it doesn't accidentally also
+  trigger capture/undo/finish/cancel on the same keypress
+- Two themes rendering the same state are asserted to produce genuinely
+  different output — proves the HUD is actually reading
+  `self.theme_manager.theme`, not a hardcoded palette that happens to match
+  the tests
+- Visually verified across both apps, several themes, and every live-view
+  state (empty, waiting, known match, unknown match) before any of the
+  above assertions were written
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -388,8 +421,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-321 tests
-321 passed
+342 tests
+342 passed
 0 failed
 ```
 
@@ -526,6 +559,31 @@ counting pixels that match the accent (fill) color specifically. Flagging
 this because a looser version of that test would have quietly passed either
 way and told me nothing.
 
+### 11. Wiring the HUD in caught a real overflow bug
+
+`enroll.py`'s key-hint line — `"SPACE capture   U undo   ENTER finish   ESC
+cancel   T theme"` — measured 376px wide against a 260px-wide panel once
+actually rendered. The panel/text primitives themselves were already tested
+and correct; this was purely an integration-layer mistake (nobody had
+checked whether a *specific* string fit in a *specific* panel at a *specific*
+font size). Caught by rendering before writing tests, same as design
+decisions #8 and #10 — fixed by splitting the hint across two lines and
+widening the panel to 280px, then re-verified visually before locking in
+assertions. Noted here because it's a good example of why "the pieces are
+individually tested" doesn't automatically mean "the assembled screen is
+correct" — integration gets its own visual check every time, not just unit
+coverage.
+
+### 12. Similarity meter and prediction can't disagree about the frame
+
+`live.py`'s `process_frame()` computes `best_match()` and
+`all_similarities()` from the *same* embedding, on the *same* frame-skip
+schedule — never two separate calls that could end up looking at different
+frames. Concretely: `last_similarities` is a held reference (not
+recomputed) on skipped frames, exactly like `last_result` already was, so
+the headline prediction and the bar chart underneath it are guaranteed to
+be describing the same instant, not subtly out of sync.
+
 ---
 
 ## 🗺️ Roadmap
@@ -543,6 +601,7 @@ way and told me nothing.
 - [x] Build theme palette system (dark/light/neon/mono) with `T`-key cycling
 - [x] Build glass-panel HUD + cinematic vignette
 - [x] Build the similarity-meter signature visual
+- [x] Wire panel + vignette + meter + theme cycling into enroll.py/live.py's actual HUD
 - [ ] Add ambient audio + SFX (fail-soft)
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
@@ -560,10 +619,11 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (321/321 passing).
-**Phase 2 is underway:** typography, themes, glass-panel HUD, vignette, and
-the similarity meter are done and tested (including visual spot-checks, not
-just assertions); only audio is left to build.
+camera-app logic, and CLI — are built and unit tested (342/342 passing).
+**Phase 2 is nearly done:** typography, themes, glass-panel HUD, vignette,
+and the similarity meter are all built, tested, and now actually wired into
+`enroll.py`/`live.py`'s real `render_preview()` — not just standalone
+functions in `ui.py` anymore. Only ambient audio/SFX is left.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -574,15 +634,14 @@ What hasn't happened yet, and can't happen from this sandbox:
 - No real-world semantic-quality check yet (same object → higher similarity
   than a different object, on actual photos rather than the mock model)
 - No check of the typography/panel/vignette/meter system composited over a live,
-  MOVING camera feed with a real background — every theme was rendered and
-  visually confirmed as a still PNG (see design decisions #8 and #10), which
-  is a real check, just not the same one as watching it run live
+  MOVING camera feed with a real background — every theme, and both apps'
+  full HUD, was rendered and visually confirmed as a still PNG (see design
+  decisions #8, #10, and #11), which is a real check, just not the same one
+  as watching it run live
 
-Once the Phase 1 hardware checks pass on your machine and the rest of Phase 2
-(ambient audio/SFX, and wiring the now-built panel/vignette/meter into
-enroll.py/live.py's actual on-screen HUD) is built, this becomes the
-finished portfolio piece described in
-the original brief.
+Once the Phase 1 hardware checks pass on your machine and audio (the last
+piece of Phase 2) is built, this becomes the finished portfolio piece
+described in the original brief.
 
 ---
 

@@ -28,8 +28,11 @@ from protovision.enroll import (
     KEY_CANCEL,
 )
 from protovision.prototypes import PrototypeStore
+from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
 
 from conftest import make_test_frame, FakeCamera
+
+FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
 
 def make_enroll_app(
@@ -42,6 +45,8 @@ def make_enroll_app(
     box_fraction=0.5,
     state=EnrollState.CAPTURING,
     captured=None,
+    theme_manager=None,
+    glyph_cache=None,
 ) -> EnrollApp:
     """Build an EnrollApp WITHOUT calling __init__ (no real camera needed)."""
     app = EnrollApp.__new__(EnrollApp)
@@ -54,6 +59,8 @@ def make_enroll_app(
     app.box_fraction = box_fraction
     app._captured_embeddings = list(captured) if captured else []
     app.state = state
+    app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
+    app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
     app.camera = None  # never touched by the methods under test
     return app
 
@@ -133,6 +140,23 @@ class TestConstructorWithFakeCamera:
         assert app.state == EnrollState.DONE
         assert store.example_count("mug") == 3
         assert store_path.exists()
+
+    def test_default_theme_manager_and_glyph_cache_are_created(self, monkeypatch, mock_backbone, tmp_path):
+        monkeypatch.setattr("protovision.enroll.Camera", FakeCamera)
+        app = EnrollApp("mug", mock_backbone, PrototypeStore(), tmp_path / "p.json")
+        assert isinstance(app.theme_manager, ThemeManager)
+        assert isinstance(app.glyph_cache, GlyphCache)
+
+    def test_injected_theme_manager_and_glyph_cache_are_used(self, monkeypatch, mock_backbone, tmp_path):
+        monkeypatch.setattr("protovision.enroll.Camera", FakeCamera)
+        theme_mgr = ThemeManager(initial="neon")
+        cache = GlyphCache(font_dir=FONT_DIR)
+        app = EnrollApp(
+            "mug", mock_backbone, PrototypeStore(), tmp_path / "p.json",
+            theme_manager=theme_mgr, glyph_cache=cache,
+        )
+        assert app.theme_manager is theme_mgr
+        assert app.glyph_cache is cache
 
 
 # --------------------------------------------------------------------------
@@ -336,6 +360,27 @@ class TestHandleKey:
         app.handle_key(KEY_CAPTURE, make_test_frame())
         assert app.progress == (0, 8)  # capture never ran
 
+    def test_theme_key_cycles_theme(self):
+        app = make_enroll_app()
+        start = app.theme_manager.name
+        app.handle_key(KEY_THEME_TOGGLE, make_test_frame())
+        assert app.theme_manager.name != start
+
+    def test_theme_key_works_even_when_done(self, mock_backbone):
+        """Switching themes shouldn't be blocked just because the session
+        already finished or was cancelled — there's no reason to gate it
+        behind capture state."""
+        app = make_enroll_app(backbone=mock_backbone, state=EnrollState.DONE)
+        start = app.theme_manager.name
+        app.handle_key(KEY_THEME_TOGGLE, make_test_frame())
+        assert app.theme_manager.name != start
+        assert app.state == EnrollState.DONE  # state itself untouched
+
+    def test_theme_key_does_not_also_trigger_capture(self, mock_backbone):
+        app = make_enroll_app(backbone=mock_backbone, target_examples=8)
+        app.handle_key(KEY_THEME_TOGGLE, make_test_frame())
+        assert app.progress == (0, 8)  # theme toggle consumed the key, nothing else ran
+
 
 # --------------------------------------------------------------------------
 # guide box / preview helpers
@@ -361,3 +406,43 @@ class TestPreviewHelpers:
         original = frame.copy()
         app.render_preview(frame)
         np.testing.assert_array_equal(frame, original)
+
+    def test_render_preview_draws_a_panel(self):
+        """The HUD panel should actually change pixels near the top-left,
+        not just draw the guide box."""
+        app = make_enroll_app()
+        frame = make_test_frame(width=400, height=300, color=(90, 90, 90))
+        out = app.render_preview(frame)
+        assert not np.array_equal(out[30, 30], frame[30, 30])
+
+    def test_render_preview_respects_active_theme(self):
+        """Rendering under two different themes should not produce
+        identical output — proves the panel is actually using
+        self.theme_manager.theme, not some hardcoded palette."""
+        app_dark = make_enroll_app(theme_manager=ThemeManager(initial="dark"))
+        app_neon = make_enroll_app(theme_manager=ThemeManager(initial="neon"))
+        frame = make_test_frame(width=400, height=300, color=(90, 90, 90))
+        out_dark = app_dark.render_preview(frame)
+        out_neon = app_neon.render_preview(frame)
+        assert not np.array_equal(out_dark, out_neon)
+
+    def test_progress_text_uses_accent_color_once_min_examples_reached(self):
+        """Cheap end-to-end proxy: does rendering with enough examples vs.
+        not-enough produce a different frame? (Exact color-matching per
+        pixel is already covered at the ui.py level; this just confirms
+        enroll.py actually wires has_min_examples into the render.)"""
+        theme_mgr = ThemeManager(initial="dark")
+        cache = GlyphCache(font_dir=FONT_DIR)
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+
+        not_ready = make_enroll_app(
+            min_examples=5, captured=[np.zeros(4)] * 2,
+            theme_manager=ThemeManager(initial="dark"), glyph_cache=cache,
+        )
+        ready = make_enroll_app(
+            min_examples=5, captured=[np.zeros(4)] * 5,
+            theme_manager=ThemeManager(initial="dark"), glyph_cache=cache,
+        )
+        out_not_ready = not_ready.render_preview(frame)
+        out_ready = ready.render_preview(frame)
+        assert not np.array_equal(out_not_ready, out_ready)

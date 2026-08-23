@@ -159,8 +159,16 @@ class GlyphCache:
         """Total (width, height) `text` would occupy at this weight/size,
         without rendering anything."""
         width = sum(self.get_advance(ch, weight, size) for ch in text)
+        return width, self.line_height(weight, size)
+
+    def line_height(self, weight: str = "regular", size: int = 24) -> int:
+        """Vertical space one line of text occupies at this weight/size —
+        ascent + descent, independent of which characters are on it. Lets
+        HUD layout code (stacking a title above a progress line above a
+        hint line, say) size rows without rendering placeholder text just
+        to measure it."""
         ascent, descent = self._get_metrics(weight, size)
-        return width, ascent + descent
+        return ascent + descent
 
     # -- glyph rendering -----------------------------------------------
 

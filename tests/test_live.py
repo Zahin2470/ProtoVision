@@ -15,8 +15,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from protovision.live import LiveApp, KEY_QUIT_CODES
 from protovision.prototypes import PrototypeStore, MatchResult
+from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
 
 from conftest import make_test_frame, FakeCamera
+
+FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
 
 def make_live_app(
@@ -26,6 +29,8 @@ def make_live_app(
     match_mode="mean",
     frame_skip=5,
     box_fraction=0.5,
+    theme_manager=None,
+    glyph_cache=None,
 ) -> LiveApp:
     app = LiveApp.__new__(LiveApp)
     app.backbone = backbone
@@ -36,6 +41,9 @@ def make_live_app(
     app.box_fraction = box_fraction
     app._frame_counter = 0
     app._last_result = None
+    app._last_similarities = {}
+    app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
+    app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
     app.camera = None  # never touched by the methods under test
     return app
 
@@ -105,6 +113,20 @@ class TestConstructorWithFakeCamera:
         result = app.process_frame(make_test_frame())
         assert isinstance(result, MatchResult)
 
+    def test_default_theme_manager_and_glyph_cache_are_created(self, monkeypatch, mock_backbone):
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        app = LiveApp(mock_backbone, PrototypeStore())
+        assert isinstance(app.theme_manager, ThemeManager)
+        assert isinstance(app.glyph_cache, GlyphCache)
+
+    def test_injected_theme_manager_and_glyph_cache_are_used(self, monkeypatch, mock_backbone):
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        theme_mgr = ThemeManager(initial="mono")
+        cache = GlyphCache(font_dir=FONT_DIR)
+        app = LiveApp(mock_backbone, PrototypeStore(), theme_manager=theme_mgr, glyph_cache=cache)
+        assert app.theme_manager is theme_mgr
+        assert app.glyph_cache is cache
+
 
 # --------------------------------------------------------------------------
 # frame-skip inference logic
@@ -171,6 +193,43 @@ class TestFrameSkipLogic:
         result = app.process_frame(make_test_frame())
         assert isinstance(result, MatchResult)
 
+    def test_last_similarities_starts_empty(self):
+        app = make_live_app()
+        assert app.last_similarities == {}
+
+    def test_last_similarities_populated_after_inference(self, mock_backbone):
+        store = enrolled_store("mug")
+        app = make_live_app(backbone=mock_backbone, store=store)
+        app.process_frame(make_test_frame())
+        assert set(app.last_similarities.keys()) == {"mug"}
+
+    def test_last_similarities_covers_every_class_not_just_the_winner(self, mock_backbone):
+        store = enrolled_store("mug")
+        store.add_examples("bottle", [np.random.default_rng(i).normal(size=384).astype(np.float32) for i in range(5)])
+        app = make_live_app(backbone=mock_backbone, store=store)
+        app.process_frame(make_test_frame())
+        assert set(app.last_similarities.keys()) == {"mug", "bottle"}
+
+    def test_last_similarities_held_between_skipped_frames(self, mock_backbone):
+        store = enrolled_store("mug")
+        app = make_live_app(backbone=mock_backbone, store=store, frame_skip=5)
+        app.process_frame(make_test_frame(seed=1))
+        first = app.last_similarities
+        app.process_frame(make_test_frame(seed=2))  # skipped frame, shouldn't recompute
+        assert app.last_similarities is first
+
+    def test_last_similarities_respects_match_mode(self, mock_backbone):
+        store = enrolled_store("mug")
+        app_mean = make_live_app(backbone=mock_backbone, store=store, match_mode="mean")
+        app_max = make_live_app(backbone=mock_backbone, store=store, match_mode="max")
+        frame = make_test_frame()
+        app_mean.process_frame(frame)
+        app_max.process_frame(frame)
+        # max mode can only be >= mean mode for the same store/query (same
+        # reasoning already covered at the prototypes.py level) — just a
+        # sanity check that live.py actually passes match_mode through.
+        assert app_max.last_similarities["mug"] >= app_mean.last_similarities["mug"] - 1e-6
+
 
 # --------------------------------------------------------------------------
 # render_preview / quit key
@@ -190,6 +249,43 @@ class TestPreviewAndQuit:
         app.render_preview(frame)
         np.testing.assert_array_equal(frame, original)
 
+    def test_render_preview_draws_something_even_with_empty_store(self):
+        """Empty store -> the 'No classes enrolled yet' fallback panel,
+        not a crash or a blank frame."""
+        app = make_live_app(store=PrototypeStore())
+        frame = make_test_frame(width=400, height=300, color=(90, 90, 90))
+        out = app.render_preview(frame)
+        assert not np.array_equal(out[30, 30], frame[30, 30])
+
+    def test_render_preview_draws_something_before_first_inference(self):
+        """Store has classes, but process_frame hasn't run yet -> the
+        'Waiting for first frame' fallback, not an empty meter."""
+        app = make_live_app(store=enrolled_store())
+        frame = make_test_frame(width=400, height=300, color=(90, 90, 90))
+        out = app.render_preview(frame)
+        assert not np.array_equal(out[30, 30], frame[30, 30])
+
+    def test_render_preview_after_inference_shows_meter(self, mock_backbone):
+        store = enrolled_store("mug")
+        app = make_live_app(backbone=mock_backbone, store=store)
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+        app.process_frame(frame)
+        out = app.render_preview(frame)
+        assert not np.array_equal(out[30, 30], frame[30, 30])
+
+    def test_render_preview_respects_active_theme(self, mock_backbone):
+        store = enrolled_store("mug")
+        frame = make_test_frame(width=400, height=300, color=(90, 90, 90))
+
+        app_dark = make_live_app(backbone=mock_backbone, store=store, theme_manager=ThemeManager(initial="dark"))
+        app_neon = make_live_app(backbone=mock_backbone, store=store, theme_manager=ThemeManager(initial="neon"))
+        app_dark.process_frame(frame)
+        app_neon.process_frame(frame)
+
+        out_dark = app_dark.render_preview(frame)
+        out_neon = app_neon.render_preview(frame)
+        assert not np.array_equal(out_dark, out_neon)
+
     def test_is_quit_key_true_for_q(self):
         assert LiveApp.is_quit_key(ord("q")) is True
 
@@ -202,3 +298,17 @@ class TestPreviewAndQuit:
     def test_key_quit_codes_contains_expected_values(self):
         assert 27 in KEY_QUIT_CODES
         assert ord("q") in KEY_QUIT_CODES
+
+    def test_handle_key_cycles_theme_and_reports_consumed(self):
+        app = make_live_app()
+        start = app.theme_manager.name
+        consumed = app.handle_key(KEY_THEME_TOGGLE)
+        assert consumed is True
+        assert app.theme_manager.name != start
+
+    def test_handle_key_returns_false_for_other_keys(self):
+        app = make_live_app()
+        start = app.theme_manager.name
+        consumed = app.handle_key(ord("q"))
+        assert consumed is False
+        assert app.theme_manager.name == start
