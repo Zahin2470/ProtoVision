@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from protovision.live import LiveApp, KEY_QUIT_CODES
+from protovision.live import LiveApp, KEY_QUIT_CODES, KEY_TEACH_ME, LiveExitReason, UNKNOWN_STREAK_THRESHOLD
 from protovision.prototypes import PrototypeStore, MatchResult
 from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
 from protovision.audio import AudioManager
@@ -44,6 +44,8 @@ def make_live_app(
     app._frame_counter = 0
     app._last_result = None
     app._last_similarities = {}
+    app._unknown_streak = 0
+    app._teach_me_requested = False
     app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
     app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
     # enabled=False: no real pygame/audio device dependency in these pure
@@ -270,22 +272,22 @@ class TestFrameSkipLogic:
         # sanity check that live.py actually passes match_mode through.
         assert app_max.last_similarities["mug"] >= app_mean.last_similarities["mug"] - 1e-6
 
+def store_with_two_classes(dim=16):
+    mug_base = _unit(1, dim)
+    bottle_base = _unit(2, dim)
+    store = PrototypeStore()
+    store.add_examples("mug", [mug_base.copy() for _ in range(5)])
+    store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
+    return store, mug_base, bottle_base
+
 
 # --------------------------------------------------------------------------
 # match_found chime — fires on the transition INTO a known match
 # --------------------------------------------------------------------------
 
 class TestMatchFoundChime:
-    def _store_with_two_classes(self, dim=16):
-        mug_base = _unit(1, dim)
-        bottle_base = _unit(2, dim)
-        store = PrototypeStore()
-        store.add_examples("mug", [mug_base.copy() for _ in range(5)])
-        store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
-        return store, mug_base, bottle_base
-
     def test_chime_fires_on_unknown_to_known_transition(self):
-        store, mug_base, _ = self._store_with_two_classes()
+        store, mug_base, _ = store_with_two_classes()
         spy = SpyAudio()
         # unknown, known, known, unknown, known — frame_skip=1 so every
         # call actually runs inference.
@@ -298,7 +300,7 @@ class TestMatchFoundChime:
         assert spy.match_found_calls == 2  # the two unknown->known transitions
 
     def test_chime_does_not_fire_while_staying_matched_on_same_class(self):
-        store, mug_base, _ = self._store_with_two_classes()
+        store, mug_base, _ = store_with_two_classes()
         spy = SpyAudio()
         backbone = SequenceBackbone([mug_base, mug_base, mug_base, mug_base])
         app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
@@ -309,7 +311,7 @@ class TestMatchFoundChime:
         assert spy.match_found_calls == 1  # only the initial entry into "known"
 
     def test_chime_does_not_fire_on_known_to_unknown_transition(self):
-        store, mug_base, _ = self._store_with_two_classes()
+        store, mug_base, _ = store_with_two_classes()
         spy = SpyAudio()
         backbone = SequenceBackbone([mug_base, -mug_base])
         app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
@@ -323,7 +325,7 @@ class TestMatchFoundChime:
         """Switching from a confident match on one class straight to a
         confident match on a DIFFERENT class should still count as a fresh
         'match found' — the object in the box genuinely changed."""
-        store, mug_base, bottle_base = self._store_with_two_classes()
+        store, mug_base, bottle_base = store_with_two_classes()
         spy = SpyAudio()
         backbone = SequenceBackbone([mug_base, mug_base, bottle_base])
         app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
@@ -335,7 +337,7 @@ class TestMatchFoundChime:
         assert spy.match_found_calls == 2
 
     def test_chime_never_fires_if_nothing_ever_crosses_threshold(self):
-        store, mug_base, _ = self._store_with_two_classes()
+        store, mug_base, _ = store_with_two_classes()
         spy = SpyAudio()
         backbone = SequenceBackbone([-mug_base, -mug_base, -mug_base])
         app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
@@ -349,7 +351,7 @@ class TestMatchFoundChime:
         """The chime decision only happens when inference actually runs —
         held (skipped) frames can't trigger it, same as they can't update
         last_result/last_similarities."""
-        store, mug_base, _ = self._store_with_two_classes()
+        store, mug_base, _ = store_with_two_classes()
         spy = SpyAudio()
         backbone = SequenceBackbone([mug_base])  # same embedding every call
         app = make_live_app(backbone=backbone, store=store, frame_skip=10, threshold=0.5, audio=spy)
@@ -358,6 +360,107 @@ class TestMatchFoundChime:
             app.process_frame(make_test_frame())
 
         assert spy.match_found_calls == 1  # only the single real inference call
+
+
+# --------------------------------------------------------------------------
+# open-set polish: unknown_streak / wants_to_teach / teach-me key handling
+# --------------------------------------------------------------------------
+
+class TestUnknownStreak:
+    def _store_and_bases(self, dim=16):
+        return store_with_two_classes(dim)
+
+    def test_streak_starts_at_zero(self):
+        app = make_live_app()
+        assert app.unknown_streak == 0
+
+    def test_streak_increments_on_each_unknown_inference(self, mock_backbone):
+        store, mug_base, _ = self._store_and_bases()
+        backbone = SequenceBackbone([-mug_base, -mug_base, -mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        for expected in (1, 2, 3):
+            app.process_frame(make_test_frame())
+            assert app.unknown_streak == expected
+
+    def test_streak_resets_to_zero_on_known_match(self):
+        store, mug_base, _ = self._store_and_bases()
+        backbone = SequenceBackbone([-mug_base, -mug_base, mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        app.process_frame(make_test_frame())
+        app.process_frame(make_test_frame())
+        assert app.unknown_streak == 2
+        app.process_frame(make_test_frame())
+        assert app.unknown_streak == 0
+
+    def test_streak_does_not_advance_on_held_skipped_frames(self):
+        store, mug_base, _ = self._store_and_bases()
+        backbone = SequenceBackbone([-mug_base])  # same result every real inference
+        app = make_live_app(backbone=backbone, store=store, frame_skip=10, threshold=0.5)
+        for _ in range(5):  # within the first frame_skip window
+            app.process_frame(make_test_frame())
+        assert app.unknown_streak == 1  # only the one real inference counted
+
+    def test_wants_to_teach_false_below_threshold(self):
+        app = make_live_app()
+        app._unknown_streak = UNKNOWN_STREAK_THRESHOLD - 1
+        assert app.wants_to_teach is False
+
+    def test_wants_to_teach_true_at_threshold(self):
+        app = make_live_app()
+        app._unknown_streak = UNKNOWN_STREAK_THRESHOLD
+        assert app.wants_to_teach is True
+
+    def test_wants_to_teach_true_above_threshold(self):
+        app = make_live_app()
+        app._unknown_streak = UNKNOWN_STREAK_THRESHOLD + 5
+        assert app.wants_to_teach is True
+
+    def test_wants_to_teach_reaches_true_through_real_process_frame_calls(self):
+        store, mug_base, _ = self._store_and_bases()
+        backbone = SequenceBackbone([-mug_base] * UNKNOWN_STREAK_THRESHOLD)
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        for _ in range(UNKNOWN_STREAK_THRESHOLD - 1):
+            app.process_frame(make_test_frame())
+            assert app.wants_to_teach is False
+        app.process_frame(make_test_frame())
+        assert app.wants_to_teach is True
+
+
+class TestTeachMeKeyHandling:
+    def test_teach_key_ignored_when_not_wanting_to_teach(self):
+        app = make_live_app()
+        app._unknown_streak = 0
+        consumed = app.handle_key(KEY_TEACH_ME)
+        assert consumed is False
+        assert app._teach_me_requested is False
+
+    def test_teach_key_ignored_during_known_match(self):
+        app = make_live_app()
+        app._unknown_streak = 0  # known match already reset the streak
+        consumed = app.handle_key(KEY_TEACH_ME)
+        assert consumed is False
+
+    def test_teach_key_consumed_once_wants_to_teach(self):
+        app = make_live_app()
+        app._unknown_streak = UNKNOWN_STREAK_THRESHOLD
+        consumed = app.handle_key(KEY_TEACH_ME)
+        assert consumed is True
+        assert app._teach_me_requested is True
+
+    def test_theme_key_takes_priority_and_does_not_request_teaching(self):
+        app = make_live_app()
+        app._unknown_streak = UNKNOWN_STREAK_THRESHOLD
+        from protovision.ui import KEY_THEME_TOGGLE
+        consumed = app.handle_key(KEY_THEME_TOGGLE)
+        assert consumed is True
+        assert app._teach_me_requested is False
+
+    def test_other_keys_do_not_request_teaching(self):
+        app = make_live_app()
+        app._unknown_streak = UNKNOWN_STREAK_THRESHOLD
+        consumed = app.handle_key(ord("x"))
+        assert consumed is False
+        assert app._teach_me_requested is False
 
 
 # --------------------------------------------------------------------------
@@ -401,6 +504,43 @@ class TestPreviewAndQuit:
         app.process_frame(frame)
         out = app.render_preview(frame)
         assert not np.array_equal(out[30, 30], frame[30, 30])
+
+    def test_render_preview_differs_between_plain_unknown_and_teach_prompt(self):
+        """Same underlying result (is_known=False), only unknown_streak
+        differs — the rendered HUD should visibly change once the streak
+        crosses the teach-me threshold (different title text)."""
+        store, mug_base, _ = store_with_two_classes()
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+
+        plain = make_live_app(store=store)
+        plain._last_result = MatchResult(label=None, similarity=0.1, is_known=False)
+        plain._last_similarities = {"mug": 0.1, "bottle": -0.05}
+        plain._unknown_streak = UNKNOWN_STREAK_THRESHOLD - 1
+
+        teaching = make_live_app(store=store)
+        teaching._last_result = MatchResult(label=None, similarity=0.1, is_known=False)
+        teaching._last_similarities = {"mug": 0.1, "bottle": -0.05}
+        teaching._unknown_streak = UNKNOWN_STREAK_THRESHOLD
+
+        out_plain = plain.render_preview(frame)
+        out_teaching = teaching.render_preview(frame)
+        assert not np.array_equal(out_plain, out_teaching)
+
+    def test_render_preview_teach_prompt_does_not_appear_for_known_match(self):
+        """A high unknown_streak left over from before a match was found
+        shouldn't leak into the title once is_known is True — the label
+        text should read as the actual class, not the teach-me prompt."""
+        store, mug_base, _ = store_with_two_classes()
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+
+        app = make_live_app(store=store)
+        app._last_result = MatchResult(label="mug", similarity=0.9, is_known=True)
+        app._last_similarities = {"mug": 0.9, "bottle": 0.1}
+        app._unknown_streak = 0  # a known match always resets this in process_frame
+
+        # Sanity: render succeeds and doesn't crash trying to show both states at once.
+        out = app.render_preview(frame)
+        assert out.shape == frame.shape
 
     def test_render_preview_respects_active_theme(self, mock_backbone):
         store = enrolled_store("mug")

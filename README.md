@@ -92,14 +92,14 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **396/396 passing** |
+| 🧪 Strong test coverage | Current test suite reports **418/418 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested.**
+> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — in progress (pick-a-few enrichments, one at a time).**
 
 | Phase | Step | Component | Status |
 |:---:|:---:|---|:---:|
@@ -112,6 +112,10 @@ Example Images
 | 2 | **3** | `ui.py` — similarity-meter signature visual | ✅ Complete & tested |
 | 2 | **4** | HUD wired into `enroll.py`/`live.py` (panel + meter + vignette + theme key) | ✅ Complete & tested |
 | 2 | **5** | `audio.py` — fail-soft SFX + ambient audio, wired into enroll/live | ✅ Complete & tested |
+| 3 | **1** | Open-set polish — sustained "New object? Press N" prompt + live→enroll→live handoff | ✅ Complete & tested |
+| 3 | **2** | Match debugging (which stored example matched + noisy/confusable-enrollment warnings) | ⏳ Not started |
+| 3 | **3** | Export/import a shareable "recognizer pack" file | ⏳ Not started |
+| 3 | **4** | CPU latency benchmark script | ⏳ Not started |
 
 ---
 
@@ -150,7 +154,7 @@ ProtoVision/
 │   └── audio/
 │       ├── sfx/           # enroll_success.wav, match_found.wav
 │       └── music/         # ambient_pad.wav
-├── tests/              # Automated tests (396, all passing)
+├── tests/              # Automated tests (418, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -174,6 +178,11 @@ python main.py live
 python main.py live --threshold 0.6 --match-mode max --frame-skip 3
 
 # T cycles the theme (dark/light/neon/mono) in either command, live too
+
+# During live recognition, once an object has stayed unrecognized long
+# enough the HUD offers "New object? Press N" — pressing N drops straight
+# into an enrollment session for it (same process, same loaded backbone),
+# then automatically resumes live recognition afterward
 
 # Disable audio entirely (SFX + ambient) — audio already fails silently on
 # its own if pygame or a device isn't available, --mute is for explicitly
@@ -405,6 +414,30 @@ actual `render_preview()`
   in a `finally` block) — the ambient loop shouldn't be left playing
   forever just because the camera loop crashed
 
+**Phase 3, step 1: open-set polish**
+
+- `unknown_streak` increments only on real inferences (not held/skipped
+  frames), resets to zero the instant a known match appears, and
+  `wants_to_teach` flips true only once the streak is sustained — not on a
+  single low-confidence blip
+- The `N` key is a no-op unless `wants_to_teach` is already true — tested
+  explicitly so pressing it during a normal "unknown" moment, or during a
+  known match, can't accidentally queue up teaching whatever happened to be
+  in the box a second ago
+- The rendered HUD is confirmed to actually differ between "plain unknown"
+  and "sustained unknown, showing the teach prompt" for the *same*
+  underlying match result — proving the visual state change is real, not
+  just the internal flag
+- `main.py`'s live↔enroll handoff loop is tested at the CLI dispatch level
+  with a scripted sequence of `LiveExitReason`s (QUIT immediately / TEACH →
+  QUIT / TEACH with a blank label → cancel → resume): confirms the label
+  prompt is asked, a blank answer skips enrollment without constructing an
+  `EnrollApp`, live recognition always resumes afterward (enrolled or
+  cancelled), and — the actual point of doing this in-process —
+  `load_default_backbone()` is called exactly once across the whole loop,
+  and the same `ThemeManager` instance is shared across every `LiveApp`/
+  `EnrollApp` construction in the handoff, not reset each time
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -434,6 +467,13 @@ The following require the real DINOv3 weights and/or actual hardware:
   They're also deliberately simple procedural placeholders (see
   `assets/audio/NOTICE.md`), not a finished sound design — worth an actual
   listen on your machine, and worth swapping for something better anytime.
+- **Whether the teach-me handoff actually feels smooth in practice.** The
+  loop logic (label prompt, shared backbone/theme, resuming live
+  recognition) is tested at the dispatch level with fakes; whether the
+  window closing and reopening between live and enroll sessions is jarring
+  or feels natural, and whether `UNKNOWN_STREAK_THRESHOLD`'s default of 3
+  inferences feels like the right delay before the prompt appears, are both
+  judgment calls that need your eyes and your webcam to settle.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -475,8 +515,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-396 tests
-396 passed
+418 tests
+418 passed
 0 failed
 ```
 
@@ -683,6 +723,38 @@ it not to" are different states with different tests (`AudioManager.available`
 vs. `AudioManager.enabled`), and conflating them would make a genuinely
 broken audio setup look identical to an intentionally quiet one.
 
+### 16. "Sustained" unknown, not "instant" unknown
+
+The brief asked for open-set handling to feel deliberate, not reactive. A
+single unknown frame is extremely common and mostly meaningless — someone's
+hand passing through the guide box while repositioning an object, a bad
+angle for one frame, whatever. Offering to teach on the very first unknown
+inference would make the prompt feel twitchy and untrustworthy. Requiring
+`UNKNOWN_STREAK_THRESHOLD` (3) *consecutive* unknown inferences — which,
+combined with `frame_skip`, is a real span of wall-clock time, not three
+frames — means the prompt only appears once something has genuinely been
+sitting in the box unrecognized for a while. The threshold is a plain
+module constant specifically so it's easy to tune once real timing is
+measured on your machine, rather than buried in logic.
+
+### 17. Teaching happens in-process, not as a separate CLI invocation
+
+The obvious simpler alternative was: `live` exits, prints "run `enroll
+--label X` to teach me this", and stops. That technically satisfies "want
+to teach me?" but ignores the actual cost in this specific project — DINOv3
+loading is the expensive part of startup (that's the entire reason model
+loading was split from per-frame embedding back in `backbone.py`), and a
+separate CLI invocation would pay that cost again just to enroll one
+object. `cmd_live`'s loop instead hands off to `EnrollApp` *inside the same
+process*, reusing the already-loaded backbone, the same `PrototypeStore`
+instance, and the same `ThemeManager` — then automatically resumes live
+recognition afterward. The label itself is asked via a plain terminal
+`input()` prompt between camera sessions (not a GUI dialog — see the
+existing macOS Tcl-Tk note in `docs/DINOV3_SETUP.md`), and the loop
+resumes live recognition whether the enrollment that followed succeeded or
+was cancelled, so a change of mind mid-flow can't strand the user outside
+the app.
+
 ---
 
 ## 🗺️ Roadmap
@@ -702,6 +774,10 @@ broken audio setup look identical to an intentionally quiet one.
 - [x] Build the similarity-meter signature visual
 - [x] Wire panel + vignette + meter + theme cycling into enroll.py/live.py's actual HUD
 - [x] Add ambient audio + SFX (fail-soft)
+- [x] Phase 3: open-set polish (sustained "teach me?" prompt + live↔enroll handoff)
+- [ ] Phase 3: match debugging (which stored example matched + confusable-enrollment warnings)
+- [ ] Phase 3: export/import a shareable "recognizer pack" file
+- [ ] Phase 3: CPU latency benchmark script
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -718,11 +794,15 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (396/396 passing).
-**Phase 2 is also complete.** Typography, themes, glass-panel HUD, vignette,
+camera-app logic, and CLI — are built and unit tested (418/418 passing).
+**Phase 2 is complete.** Typography, themes, glass-panel HUD, vignette,
 the similarity meter, and fail-soft SFX/ambient audio are all built, tested,
 and wired into `enroll.py`/`live.py`'s real `render_preview()`/`process_frame()`
 — not standalone, unused functions in `ui.py`/`audio.py` anymore.
+**Phase 3 is in progress**, one pick-a-few enrichment at a time: open-set
+polish (sustained "New object? Press N" prompt, live→enroll→live handoff
+reusing the loaded backbone) is done; match debugging, the recognizer-pack
+export/import, and a CPU latency benchmark script are still on the list.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -741,14 +821,17 @@ What hasn't happened yet, and can't happen from this sandbox:
   speakers — they're verified to be valid, click-free, correctly-loading
   files (see design decision #13), and they're also explicitly simple
   procedural placeholders, not a finished sound design
+- No check of how the teach-me handoff actually feels in practice — window
+  transitions between live and enroll, and whether the 3-inference unknown
+  threshold before the prompt appears is well-tuned — the loop logic itself
+  is tested, that feel isn't
 
-Both phases from the original brief are now built and tested. What's left is
-entirely the hardware-dependent verification above (all on your machine, not
-something further sandbox work can substitute for) plus whatever Phase 3
-enrichment ideas from the original brief you'd want to pick from — open-set
-handling polish, per-example match debugging, prototype quality warnings
-during enrollment, export/import a "recognizer pack", or a CPU latency
-benchmark script.
+Phases 1 and 2 from the original brief are fully built and tested. Phase 3
+is a pick-a-few menu being worked through one item at a time — three
+enrichment ideas remain (match debugging, recognizer-pack export/import,
+CPU latency benchmark) alongside the hardware-dependent verification above,
+which is entirely on your machine and isn't something further sandbox work
+can substitute for.
 
 ---
 

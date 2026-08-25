@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main
 from protovision.backbone import DinoV3NotAvailableError
 from protovision.enroll import EnrollState
+from protovision.live import LiveExitReason
 from protovision.prototypes import PrototypeStore
 
 
@@ -63,6 +64,27 @@ def make_fake_live_app_cls():
 
         def run(self):
             self.ran = True
+            return LiveExitReason.QUIT
+
+    _FakeLiveApp.created = created
+    return _FakeLiveApp
+
+
+def make_fake_live_app_cls_with_reasons(reasons):
+    """Each successive LiveApp(...) construction's run() returns the next
+    reason in `reasons`, in construction order — lets tests script a
+    live -> teach -> live -> quit sequence across cmd_live's loop."""
+    created = []
+    reasons_iter = iter(reasons)
+
+    class _FakeLiveApp:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self._reason = next(reasons_iter)
+            created.append(self)
+
+        def run(self):
+            return self._reason
 
     _FakeLiveApp.created = created
     return _FakeLiveApp
@@ -481,6 +503,137 @@ class TestCmdLive:
             main.cmd_live(base_live_args(store=str(store_path)))
 
         assert fake_audio_cls.created[0].stop_ambient_calls == 1
+
+
+# --------------------------------------------------------------------------
+# cmd_live teach-me loop (open-set polish handoff into enrollment)
+# --------------------------------------------------------------------------
+
+class TestCmdLiveTeachMeLoop:
+    def test_quit_immediately_returns_without_enrolling(self, monkeypatch, tmp_path):
+        """The common case: no teach-me requested, cmd_live behaves exactly
+        like before this feature existed — one LiveApp, no EnrollApp."""
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_live_cls = make_fake_live_app_cls_with_reasons([LiveExitReason.QUIT])
+        monkeypatch.setattr(main, "LiveApp", fake_live_cls)
+        enroll_calls = []
+        monkeypatch.setattr(main, "EnrollApp", lambda **kw: enroll_calls.append(kw))
+
+        rc = main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert rc == 0
+        assert len(fake_live_cls.created) == 1
+        assert enroll_calls == []
+
+    def test_teach_me_prompts_for_label_and_enrolls(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        monkeypatch.setattr(
+            main, "LiveApp",
+            make_fake_live_app_cls_with_reasons([LiveExitReason.TEACH_ME_REQUESTED, LiveExitReason.QUIT]),
+        )
+        fake_enroll_cls = make_fake_enroll_app_cls(EnrollState.DONE, captured_count=5)
+        monkeypatch.setattr(main, "EnrollApp", fake_enroll_cls)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "mug")
+
+        rc = main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert rc == 0
+        assert fake_enroll_cls.created[0].kwargs["label"] == "mug"
+
+    def test_teach_me_then_resumes_live_recognition(self, monkeypatch, tmp_path):
+        """After a successful (or cancelled) enrollment, cmd_live should
+        loop back into a FRESH live session, not just exit."""
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_live_cls = make_fake_live_app_cls_with_reasons(
+            [LiveExitReason.TEACH_ME_REQUESTED, LiveExitReason.QUIT]
+        )
+        monkeypatch.setattr(main, "LiveApp", fake_live_cls)
+        monkeypatch.setattr(main, "EnrollApp", make_fake_enroll_app_cls(EnrollState.DONE, captured_count=5))
+        monkeypatch.setattr("builtins.input", lambda prompt="": "mug")
+
+        rc = main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert rc == 0
+        assert len(fake_live_cls.created) == 2  # initial session + resumed session
+
+    def test_blank_label_cancels_without_enrolling(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_live_cls = make_fake_live_app_cls_with_reasons(
+            [LiveExitReason.TEACH_ME_REQUESTED, LiveExitReason.QUIT]
+        )
+        monkeypatch.setattr(main, "LiveApp", fake_live_cls)
+        enroll_calls = []
+        monkeypatch.setattr(main, "EnrollApp", lambda **kw: enroll_calls.append(kw))
+        monkeypatch.setattr("builtins.input", lambda prompt="": "   ")  # blank/whitespace -> cancel
+
+        rc = main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert rc == 0
+        assert enroll_calls == []
+        assert len(fake_live_cls.created) == 2  # still resumes live afterward
+
+    def test_backbone_loaded_only_once_across_teach_loop(self, monkeypatch, tmp_path):
+        """The whole point of handling this in-process: DINOv3 shouldn't
+        be reloaded just because the user taught it something mid-session."""
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        load_calls = []
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: load_calls.append(1) or object())
+        monkeypatch.setattr(
+            main, "LiveApp",
+            make_fake_live_app_cls_with_reasons([LiveExitReason.TEACH_ME_REQUESTED, LiveExitReason.QUIT]),
+        )
+        monkeypatch.setattr(main, "EnrollApp", make_fake_enroll_app_cls(EnrollState.DONE, captured_count=5))
+        monkeypatch.setattr("builtins.input", lambda prompt="": "mug")
+
+        main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert len(load_calls) == 1
+
+    def test_theme_manager_shared_between_live_and_enroll(self, monkeypatch, tmp_path):
+        """Switching themes during live shouldn't reset back to default
+        the moment enrollment starts."""
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_live_cls = make_fake_live_app_cls_with_reasons(
+            [LiveExitReason.TEACH_ME_REQUESTED, LiveExitReason.QUIT]
+        )
+        monkeypatch.setattr(main, "LiveApp", fake_live_cls)
+        fake_enroll_cls = make_fake_enroll_app_cls(EnrollState.DONE, captured_count=5)
+        monkeypatch.setattr(main, "EnrollApp", fake_enroll_cls)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "mug")
+
+        main.cmd_live(base_live_args(store=str(store_path)))
+
+        live_theme = fake_live_cls.created[0].kwargs["theme_manager"]
+        enroll_theme = fake_enroll_cls.created[0].kwargs["theme_manager"]
+        resumed_live_theme = fake_live_cls.created[1].kwargs["theme_manager"]
+        assert live_theme is enroll_theme is resumed_live_theme
+
+    def test_cancelled_enrollment_still_resumes_live(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_live_cls = make_fake_live_app_cls_with_reasons(
+            [LiveExitReason.TEACH_ME_REQUESTED, LiveExitReason.QUIT]
+        )
+        monkeypatch.setattr(main, "LiveApp", fake_live_cls)
+        monkeypatch.setattr(main, "EnrollApp", make_fake_enroll_app_cls(EnrollState.CANCELLED))
+        monkeypatch.setattr("builtins.input", lambda prompt="": "mug")
+
+        rc = main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert rc == 0
+        assert len(fake_live_cls.created) == 2
 
 
 # --------------------------------------------------------------------------

@@ -10,6 +10,11 @@ Usage:
     python main.py live --mute
     python main.py list
 
+'live' also supports on-the-fly teaching: once an object has stayed
+unrecognized long enough, the HUD offers "New object? Press N" — pressing N
+drops straight into an enrollment session for it (reusing the already-loaded
+backbone, not reloading DINOv3), then automatically resumes live recognition.
+
 This file is intentionally thin: argument parsing + wiring only. All real
 logic lives in enroll.py/live.py/prototypes.py/backbone.py/audio.py, each
 already unit tested on its own. What's tested HERE (see tests/test_main.py)
@@ -26,8 +31,9 @@ from typing import Optional, Sequence
 
 from protovision.backbone import DinoV3NotAvailableError, load_default_backbone
 from protovision.enroll import EnrollApp, EnrollState
-from protovision.live import LiveApp
+from protovision.live import LiveApp, LiveExitReason
 from protovision.prototypes import PrototypeStore
+from protovision.ui import ThemeManager
 from protovision.audio import AudioManager
 
 DEFAULT_STORE_PATH = "data/prototypes.json"
@@ -172,31 +178,73 @@ def cmd_enroll(args: argparse.Namespace) -> int:
 
 
 def cmd_live(args: argparse.Namespace) -> int:
+    """
+    Runs live recognition, and — if the user presses 'N' once the open-set
+    "New object? Press N" prompt appears (see live.py's unknown_streak /
+    wants_to_teach) — hands off into an enrollment session for whatever's
+    in the box right now, then automatically resumes live recognition
+    afterward. Backbone, store, audio, and theme are all shared/reused
+    across that handoff rather than reloaded: DINOv3 loading is the
+    expensive part, and there's no reason to pay for it twice just because
+    the user taught the system a new object mid-session.
+    """
     backbone = _load_backbone_or_exit(args)
     store = PrototypeStore.load_or_empty(args.store)
-    if store.is_empty():
-        print(
-            f"warning: no classes enrolled yet in '{args.store}' — everything will show as 'unknown'. "
-            "Run 'python main.py enroll --label <name>' first.",
-            file=sys.stderr,
-        )
     audio = AudioManager(enabled=not args.mute)
-    app = LiveApp(
-        backbone=backbone,
-        store=store,
-        threshold=args.threshold,
-        match_mode=args.match_mode,
-        frame_skip=args.frame_skip,
-        box_fraction=args.box_fraction,
-        audio=audio,
-    )
-    print("Live recognition running — 'q' or Esc to quit, 'T' to cycle themes.")
-    audio.start_ambient()
-    try:
-        app.run()
-    finally:
-        audio.stop_ambient()
-    return 0
+    theme_manager = ThemeManager()  # persists across the live<->enroll handoff below
+
+    while True:
+        if store.is_empty():
+            print(
+                f"warning: no classes enrolled yet in '{args.store}' — everything will show as "
+                "'unknown'. Run 'python main.py enroll --label <name>' first, or press N once the "
+                "open-set prompt appears during live recognition.",
+                file=sys.stderr,
+            )
+        app = LiveApp(
+            backbone=backbone,
+            store=store,
+            threshold=args.threshold,
+            match_mode=args.match_mode,
+            frame_skip=args.frame_skip,
+            box_fraction=args.box_fraction,
+            audio=audio,
+            theme_manager=theme_manager,
+        )
+        print(
+            "Live recognition running — 'q'/Esc to quit, 'T' to cycle themes, "
+            "'N' to teach a new object once prompted."
+        )
+        audio.start_ambient()
+        try:
+            reason = app.run()
+        finally:
+            audio.stop_ambient()
+
+        if reason != LiveExitReason.TEACH_ME_REQUESTED:
+            return 0
+
+        label = input("New object detected — what should I call it? (blank to cancel): ").strip()
+        if not label:
+            print("Cancelled — resuming live recognition.")
+            continue
+
+        enroll_app = EnrollApp(
+            label=label,
+            backbone=backbone,
+            store=store,
+            store_path=args.store,
+            audio=audio,
+            theme_manager=theme_manager,
+        )
+        print(f"Enrolling '{label}' — SPACE=capture  u=undo  Enter=finish early  Esc=cancel  T=theme")
+        final_state = enroll_app.run()
+        if final_state == EnrollState.DONE:
+            captured, _ = enroll_app.progress
+            print(f"Saved {captured} example(s) for '{label}'. Resuming live recognition...")
+        else:
+            print(f"Enrollment of '{label}' cancelled. Resuming live recognition...")
+        # loop back around into live recognition
 
 
 COMMANDS = {

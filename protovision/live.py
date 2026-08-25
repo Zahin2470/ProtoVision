@@ -19,6 +19,7 @@ enough not to need this.
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -39,6 +40,13 @@ from .ui import (
 from .audio import AudioManager
 
 KEY_QUIT_CODES = (27, ord("q"))  # Esc or 'q'
+KEY_TEACH_ME = ord("n")
+
+# How many consecutive UNKNOWN inferences (not frames — respects frame_skip)
+# before the HUD offers to teach the object, rather than reacting to a
+# single low-confidence blip. "Sustained", per the brief's open-set-polish
+# request, not "instant".
+UNKNOWN_STREAK_THRESHOLD = 3
 
 # HUD layout constants (see render_preview).
 _PANEL_X, _PANEL_Y = 20, 20
@@ -50,6 +58,15 @@ _METER_FONT_SIZE = 13
 _METER_BAR_HEIGHT = 14
 _METER_ROW_GAP = 10
 _ROW_GAP = 10
+
+
+class LiveExitReason(Enum):
+    """Why run() returned — main.py uses this to decide whether to just
+    exit (QUIT) or hand off into an enrollment session for whatever's
+    currently in the guide box (TEACH_ME_REQUESTED)."""
+
+    QUIT = auto()
+    TEACH_ME_REQUESTED = auto()
 
 
 class LiveApp:
@@ -81,6 +98,8 @@ class LiveApp:
         self._frame_counter = 0
         self._last_result: Optional[MatchResult] = None
         self._last_similarities: Dict[str, float] = {}
+        self._unknown_streak = 0
+        self._teach_me_requested = False
 
         # Visual design system (Phase 2) — defaulted rather than required,
         # so anything constructing a LiveApp without caring about the HUD
@@ -108,6 +127,19 @@ class LiveApp:
         with at least one enrolled class has been processed."""
         return self._last_similarities
 
+    @property
+    def unknown_streak(self) -> int:
+        """Consecutive UNKNOWN inferences so far (resets to 0 the moment a
+        known match is found). Counts inferences, not raw frames — a
+        skipped frame neither adds to nor resets this."""
+        return self._unknown_streak
+
+    @property
+    def wants_to_teach(self) -> bool:
+        """True once the unknown streak is long enough that the HUD should
+        offer the 'teach me?' prompt instead of a plain 'unknown' label."""
+        return self._unknown_streak >= UNKNOWN_STREAK_THRESHOLD
+
     def _should_run_inference(self) -> bool:
         # Always infer on the very first frame (no prior result to hold),
         # then every `frame_skip`-th frame after that.
@@ -129,6 +161,10 @@ class LiveApp:
         re-trigger the chime; without that check this would fire every
         `frame_skip`-th frame for as long as an object sits in the box,
         which is a chime storm, not a notification.
+
+        Also tracks `unknown_streak` — consecutive unknown inferences —
+        which drives the open-set "want to teach me?" HUD prompt once it's
+        sustained rather than a single low-confidence blip.
         """
         run_inference = self._should_run_inference()
 
@@ -149,6 +185,11 @@ class LiveApp:
             if newly_matched:
                 self.audio.play_match_found()
 
+            if new_result.is_known:
+                self._unknown_streak = 0
+            else:
+                self._unknown_streak += 1
+
             self._last_result = new_result
 
         self._frame_counter += 1
@@ -160,7 +201,10 @@ class LiveApp:
         current prediction and the similarity-meter signature visual (one
         bar per known class), then a cinematic vignette. Falls back to a
         small status-only panel if nothing's enrolled yet or no inference
-        has run yet, rather than drawing an empty meter.
+        has run yet, rather than drawing an empty meter. Once the unknown
+        streak is sustained (`wants_to_teach`), the headline text switches
+        to a deliberate "New object? Press N" prompt instead of a passive
+        "unknown" label — the open-set-polish behavior from the brief.
         """
         box = compute_guide_box(frame.shape[1], frame.shape[0], self.box_fraction)
         out = draw_guide_box(frame, box)
@@ -187,8 +231,15 @@ class LiveApp:
 
         result = self._last_result
         is_known = bool(result and result.is_known)
-        label_text = result.label if is_known else "unknown"
-        label_color = theme.accent_known if is_known else theme.accent_unknown
+        if is_known:
+            label_text = result.label
+            label_color = theme.accent_known
+        elif self.wants_to_teach:
+            label_text = "New object? Press N"
+            label_color = theme.accent_unknown
+        else:
+            label_text = "unknown"
+            label_color = theme.accent_unknown
 
         # Stable alphabetical order rather than sorted-by-score: a ranked
         # order looks nice but causes rows to visibly swap places whenever
@@ -223,10 +274,23 @@ class LiveApp:
         return apply_theme_vignette(out, theme)
 
     def handle_key(self, key: int) -> bool:
-        """Theme-toggle handling — factored out so run()'s loop can check
-        it before falling through to the quit check. Returns True if the
-        key was consumed."""
-        return self.theme_manager.handle_key(key)
+        """
+        Theme-toggle and teach-me handling — factored out so run()'s loop
+        can check this before falling through to the quit check. Returns
+        True if the key was consumed.
+
+        `N` only does anything once `wants_to_teach` is already true (the
+        HUD is actually showing the prompt) — pressing it during a normal
+        "unknown" blip, or while a known match is showing, is a no-op
+        rather than accidentally queuing up an enrollment for whatever
+        happened to be in the box a moment ago.
+        """
+        if self.theme_manager.handle_key(key):
+            return True
+        if key == KEY_TEACH_ME and self.wants_to_teach:
+            self._teach_me_requested = True
+            return True
+        return False
 
     @staticmethod
     def is_quit_key(key: int) -> bool:
@@ -234,10 +298,11 @@ class LiveApp:
 
     # -- real camera loop (NOT unit tested — needs actual hardware/display) --
 
-    def run(self) -> None:  # pragma: no cover
+    def run(self) -> LiveExitReason:  # pragma: no cover
         """Blocking loop: show the webcam feed with live predictions overlaid,
-        'q'/Esc to quit, 'T' to cycle themes. Not covered by tests — see
-        module docstring."""
+        'q'/Esc to quit, 'T' to cycle themes, 'N' to request teaching once
+        the HUD is showing that prompt. Not covered by tests — see module
+        docstring."""
         import cv2  # local import: only needed for the real, non-testable loop
 
         window_name = "ProtoVision — Live"
@@ -251,9 +316,11 @@ class LiveApp:
                 cv2.imshow(window_name, preview)
                 key = cv2.waitKey(1) & 0xFF
                 if self.handle_key(key):
+                    if self._teach_me_requested:
+                        return LiveExitReason.TEACH_ME_REQUESTED
                     continue
                 if self.is_quit_key(key):
-                    break
+                    return LiveExitReason.QUIT
         finally:
             self.camera.release()
             cv2.destroyWindow(window_name)
