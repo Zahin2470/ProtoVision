@@ -7,13 +7,14 @@ Usage:
     python main.py enroll --label mug --target-examples 10 --min-examples 6
     python main.py live
     python main.py live --threshold 0.6 --match-mode max --frame-skip 3
+    python main.py live --mute
     python main.py list
 
 This file is intentionally thin: argument parsing + wiring only. All real
-logic lives in enroll.py/live.py/prototypes.py/backbone.py, each already
-unit tested on its own. What's tested HERE (see tests/test_main.py) is the
-argument parsing and command dispatch — using a fake backbone/app so no
-real camera or DINOv3 weights are needed — not the real camera runs
+logic lives in enroll.py/live.py/prototypes.py/backbone.py/audio.py, each
+already unit tested on its own. What's tested HERE (see tests/test_main.py)
+is the argument parsing and command dispatch — using a fake backbone/app so
+no real camera or DINOv3 weights are needed — not the real camera runs
 themselves, which need actual hardware.
 """
 
@@ -27,6 +28,7 @@ from protovision.backbone import DinoV3NotAvailableError, load_default_backbone
 from protovision.enroll import EnrollApp, EnrollState
 from protovision.live import LiveApp
 from protovision.prototypes import PrototypeStore
+from protovision.audio import AudioManager
 
 DEFAULT_STORE_PATH = "data/prototypes.json"
 
@@ -55,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--device", default="cpu", choices=["cpu", "cuda", "mps"],
         help="Torch device to run the backbone on (default: cpu). See docs/DINOV3_SETUP.md before trying mps.",
+    )
+    common.add_argument(
+        "--mute", action="store_true",
+        help="Disable all audio (SFX and ambient). Audio is already fail-soft — this is for "
+        "explicitly turning it off, not for working around a broken audio device.",
     )
 
     parser = argparse.ArgumentParser(
@@ -143,6 +150,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_enroll(args: argparse.Namespace) -> int:
     backbone = _load_backbone_or_exit(args)
     store = PrototypeStore.load_or_empty(args.store)
+    audio = AudioManager(enabled=not args.mute)
     app = EnrollApp(
         label=args.label,
         backbone=backbone,
@@ -151,8 +159,9 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         target_examples=args.target_examples,
         min_examples=args.min_examples,
         box_fraction=args.box_fraction,
+        audio=audio,
     )
-    print(f"Enrolling '{app.label}' — SPACE=capture  u=undo  Enter=finish early  Esc=cancel")
+    print(f"Enrolling '{app.label}' — SPACE=capture  u=undo  Enter=finish early  Esc=cancel  T=theme")
     final_state = app.run()
     if final_state == EnrollState.DONE:
         captured, _ = app.progress
@@ -171,6 +180,7 @@ def cmd_live(args: argparse.Namespace) -> int:
             "Run 'python main.py enroll --label <name>' first.",
             file=sys.stderr,
         )
+    audio = AudioManager(enabled=not args.mute)
     app = LiveApp(
         backbone=backbone,
         store=store,
@@ -178,9 +188,14 @@ def cmd_live(args: argparse.Namespace) -> int:
         match_mode=args.match_mode,
         frame_skip=args.frame_skip,
         box_fraction=args.box_fraction,
+        audio=audio,
     )
-    print("Live recognition running — 'q' or Esc to quit.")
-    app.run()
+    print("Live recognition running — 'q' or Esc to quit, 'T' to cycle themes.")
+    audio.start_ambient()
+    try:
+        app.run()
+    finally:
+        audio.stop_ambient()
     return 0
 
 

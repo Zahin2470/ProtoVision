@@ -29,8 +29,9 @@ from protovision.enroll import (
 )
 from protovision.prototypes import PrototypeStore
 from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
+from protovision.audio import AudioManager
 
-from conftest import make_test_frame, FakeCamera
+from conftest import make_test_frame, FakeCamera, SpyAudio
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
@@ -47,6 +48,7 @@ def make_enroll_app(
     captured=None,
     theme_manager=None,
     glyph_cache=None,
+    audio=None,
 ) -> EnrollApp:
     """Build an EnrollApp WITHOUT calling __init__ (no real camera needed)."""
     app = EnrollApp.__new__(EnrollApp)
@@ -61,6 +63,10 @@ def make_enroll_app(
     app.state = state
     app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
     app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
+    # enabled=False: no real pygame/audio device dependency in these pure
+    # logic tests; still exercises the real AudioManager fail-soft path
+    # rather than a mock, since it's always a safe no-op either way.
+    app.audio = audio if audio is not None else AudioManager(enabled=False)
     app.camera = None  # never touched by the methods under test
     return app
 
@@ -128,6 +134,17 @@ class TestConstructorWithFakeCamera:
         injected = FakeCamera()
         app = EnrollApp("mug", mock_backbone, PrototypeStore(), tmp_path / "p.json", camera=injected)
         assert app.camera is injected
+
+    def test_default_audio_manager_is_created(self, monkeypatch, mock_backbone, tmp_path):
+        monkeypatch.setattr("protovision.enroll.Camera", FakeCamera)
+        app = EnrollApp("mug", mock_backbone, PrototypeStore(), tmp_path / "p.json")
+        assert isinstance(app.audio, AudioManager)
+
+    def test_injected_audio_manager_is_used(self, monkeypatch, mock_backbone, tmp_path):
+        monkeypatch.setattr("protovision.enroll.Camera", FakeCamera)
+        spy = SpyAudio()
+        app = EnrollApp("mug", mock_backbone, PrototypeStore(), tmp_path / "p.json", audio=spy)
+        assert app.audio is spy
 
     def test_full_capture_session_end_to_end(self, monkeypatch, mock_backbone, tmp_path):
         """Real __init__ + real capture/finish logic, still no hardware."""
@@ -293,6 +310,34 @@ class TestFinish:
         app = make_enroll_app(state=EnrollState.DONE, captured=[np.zeros(4)] * 3, min_examples=2)
         with pytest.raises(RuntimeError):
             app.finish()
+
+    def test_finish_plays_enroll_success_chime(self, tmp_path):
+        spy = SpyAudio()
+        vecs = [np.random.default_rng(i).normal(size=8).astype(np.float32) for i in range(3)]
+        app = make_enroll_app(store_path=tmp_path / "p.json", min_examples=2, captured=vecs, audio=spy)
+        app.finish()
+        assert spy.enroll_success_calls == 1
+
+    def test_finish_below_min_does_not_play_chime(self):
+        spy = SpyAudio()
+        app = make_enroll_app(min_examples=5, captured=[np.zeros(4)] * 2, audio=spy)
+        with pytest.raises(NotEnoughExamplesError):
+            app.finish()
+        assert spy.enroll_success_calls == 0
+
+    def test_capture_auto_finish_also_plays_chime(self, mock_backbone, tmp_path):
+        """finish() is also reachable via capture_example() auto-finishing
+        at target_examples — the chime should fire there too, not just on
+        an explicit finish() call."""
+        spy = SpyAudio()
+        app = make_enroll_app(
+            backbone=mock_backbone, target_examples=2, min_examples=2,
+            store_path=tmp_path / "p.json", audio=spy,
+        )
+        app.capture_example(make_test_frame(seed=1))
+        assert spy.enroll_success_calls == 0  # not yet, only 1 of 2 captured
+        app.capture_example(make_test_frame(seed=2))
+        assert spy.enroll_success_calls == 1
 
 
 # --------------------------------------------------------------------------

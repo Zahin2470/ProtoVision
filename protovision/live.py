@@ -36,6 +36,7 @@ from .ui import (
     draw_text,
     similarity_meter_height,
 )
+from .audio import AudioManager
 
 KEY_QUIT_CODES = (27, ord("q"))  # Esc or 'q'
 
@@ -63,6 +64,7 @@ class LiveApp:
         camera: Optional[Camera] = None,
         theme_manager: Optional[ThemeManager] = None,
         glyph_cache: Optional[GlyphCache] = None,
+        audio: Optional[AudioManager] = None,
     ):
         if match_mode not in ("mean", "max"):
             raise ValueError(f"match_mode must be 'mean' or 'max', got {match_mode!r}")
@@ -85,6 +87,10 @@ class LiveApp:
         # (most tests) doesn't need to know these exist.
         self.theme_manager = theme_manager or ThemeManager()
         self.glyph_cache = glyph_cache or GlyphCache()
+
+        # Audio is fail-soft by construction (see audio.py) — always safe
+        # to default-construct even with no working audio device.
+        self.audio = audio or AudioManager()
 
         # The only line in this whole class that touches real hardware.
         self.camera = camera or Camera()
@@ -115,6 +121,14 @@ class LiveApp:
         `last_similarities` (the full per-class picture, not just the
         winner) on the same schedule, so the HUD's similarity meter and the
         headline prediction never disagree about which frame they're from.
+
+        Plays the match_found chime exactly on the transition INTO a known
+        match — i.e. this inference is known and either the previous one
+        wasn't, or it was a known match for a *different* class. Staying
+        matched on the same class across consecutive inferences does not
+        re-trigger the chime; without that check this would fire every
+        `frame_skip`-th frame for as long as an object sits in the box,
+        which is a chime storm, not a notification.
         """
         run_inference = self._should_run_inference()
 
@@ -122,10 +136,20 @@ class LiveApp:
             box = compute_guide_box(frame.shape[1], frame.shape[0], self.box_fraction)
             crop = crop_guide_box(frame, box)
             embedding = self.backbone.embed(crop)
-            self._last_result = self.store.best_match(
+            previous = self._last_result
+
+            new_result = self.store.best_match(
                 embedding, threshold=self.threshold, mode=self.match_mode
             )
             self._last_similarities = self.store.all_similarities(embedding, mode=self.match_mode)
+
+            newly_matched = new_result.is_known and (
+                previous is None or not previous.is_known or previous.label != new_result.label
+            )
+            if newly_matched:
+                self.audio.play_match_found()
+
+            self._last_result = new_result
 
         self._frame_counter += 1
         return self._last_result

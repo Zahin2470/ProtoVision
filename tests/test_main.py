@@ -68,9 +68,34 @@ def make_fake_live_app_cls():
     return _FakeLiveApp
 
 
+def make_fake_audio_manager_cls():
+    """Fresh fake AudioManager class per call — records construction kwargs
+    (so tests can check --mute was respected) and start/stop_ambient calls
+    (so tests can check cmd_live's ambient-audio lifecycle) without
+    touching real pygame."""
+    created = []
+
+    class _FakeAudioManager:
+        def __init__(self, enabled=True):
+            self.enabled = enabled
+            self.start_ambient_calls = 0
+            self.stop_ambient_calls = 0
+            created.append(self)
+
+        def start_ambient(self):
+            self.start_ambient_calls += 1
+            return True
+
+        def stop_ambient(self):
+            self.stop_ambient_calls += 1
+
+    _FakeAudioManager.created = created
+    return _FakeAudioManager
+
+
 def base_enroll_args(**overrides):
     defaults = dict(
-        label="mug", store="unused.json", repo=None, weights=None, device="cpu",
+        label="mug", store="unused.json", repo=None, weights=None, device="cpu", mute=False,
         target_examples=8, min_examples=5, box_fraction=0.5,
     )
     defaults.update(overrides)
@@ -79,7 +104,7 @@ def base_enroll_args(**overrides):
 
 def base_live_args(**overrides):
     defaults = dict(
-        store="unused.json", repo=None, weights=None, device="cpu",
+        store="unused.json", repo=None, weights=None, device="cpu", mute=False,
         threshold=0.5, match_mode="mean", frame_skip=5, box_fraction=0.5,
     )
     defaults.update(overrides)
@@ -104,6 +129,22 @@ class TestArgumentParsing:
         assert args.box_fraction == 0.5
         assert args.store == main.DEFAULT_STORE_PATH
         assert args.device == "cpu"
+        assert args.mute is False
+
+    def test_mute_flag_defaults_to_false(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["live"])
+        assert args.mute is False
+
+    def test_mute_flag_can_be_set(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["live", "--mute"])
+        assert args.mute is True
+
+    def test_mute_flag_works_after_subcommand_for_enroll_too(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["enroll", "--label", "mug", "--mute"])
+        assert args.mute is True
 
     def test_enroll_overrides(self):
         parser = main.build_parser()
@@ -280,6 +321,39 @@ class TestCmdEnroll:
         with pytest.raises(SystemExit):
             main.cmd_enroll(base_enroll_args())
 
+    def test_audio_manager_passed_to_enroll_app(self, monkeypatch):
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_cls = make_fake_enroll_app_cls(EnrollState.DONE, captured_count=1)
+        monkeypatch.setattr(main, "EnrollApp", fake_cls)
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        main.cmd_enroll(base_enroll_args())
+
+        audio_instance = fake_audio_cls.created[0]
+        passed = fake_cls.created[0].kwargs
+        assert passed["audio"] is audio_instance
+
+    def test_mute_flag_disables_audio_manager(self, monkeypatch):
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        monkeypatch.setattr(main, "EnrollApp", make_fake_enroll_app_cls(EnrollState.DONE, captured_count=1))
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        main.cmd_enroll(base_enroll_args(mute=True))
+
+        assert fake_audio_cls.created[0].enabled is False
+
+    def test_unmuted_by_default(self, monkeypatch):
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        monkeypatch.setattr(main, "EnrollApp", make_fake_enroll_app_cls(EnrollState.DONE, captured_count=1))
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        main.cmd_enroll(base_enroll_args(mute=False))
+
+        assert fake_audio_cls.created[0].enabled is True
+
 
 # --------------------------------------------------------------------------
 # cmd_live dispatch
@@ -343,6 +417,70 @@ class TestCmdLive:
         monkeypatch.setattr(main, "load_default_backbone", raiser)
         with pytest.raises(SystemExit):
             main.cmd_live(base_live_args(store=str(tmp_path / "p.json")))
+
+    def test_audio_manager_passed_to_live_app(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_cls = make_fake_live_app_cls()
+        monkeypatch.setattr(main, "LiveApp", fake_cls)
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        main.cmd_live(base_live_args(store=str(store_path)))
+
+        audio_instance = fake_audio_cls.created[0]
+        passed = fake_cls.created[0].kwargs
+        assert passed["audio"] is audio_instance
+
+    def test_mute_flag_disables_audio_manager(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        monkeypatch.setattr(main, "LiveApp", make_fake_live_app_cls())
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        main.cmd_live(base_live_args(store=str(store_path), mute=True))
+
+        assert fake_audio_cls.created[0].enabled is False
+
+    def test_starts_and_stops_ambient_audio_around_run(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        monkeypatch.setattr(main, "LiveApp", make_fake_live_app_cls())
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        main.cmd_live(base_live_args(store=str(store_path)))
+
+        audio_instance = fake_audio_cls.created[0]
+        assert audio_instance.start_ambient_calls == 1
+        assert audio_instance.stop_ambient_calls == 1
+
+    def test_ambient_stopped_even_if_run_raises(self, monkeypatch, tmp_path):
+        """The ambient loop shouldn't be left playing forever just because
+        the camera loop crashed — stop_ambient() is in a finally block."""
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+
+        class _RaisingLiveApp:
+            def __init__(self, **kwargs):
+                pass
+
+            def run(self):
+                raise RuntimeError("simulated camera crash")
+
+        monkeypatch.setattr(main, "LiveApp", _RaisingLiveApp)
+        fake_audio_cls = make_fake_audio_manager_cls()
+        monkeypatch.setattr(main, "AudioManager", fake_audio_cls)
+
+        with pytest.raises(RuntimeError):
+            main.cmd_live(base_live_args(store=str(store_path)))
+
+        assert fake_audio_cls.created[0].stop_ambient_calls == 1
 
 
 # --------------------------------------------------------------------------

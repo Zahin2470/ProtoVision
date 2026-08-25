@@ -16,8 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from protovision.live import LiveApp, KEY_QUIT_CODES
 from protovision.prototypes import PrototypeStore, MatchResult
 from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
+from protovision.audio import AudioManager
 
-from conftest import make_test_frame, FakeCamera
+from conftest import make_test_frame, FakeCamera, SpyAudio
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
@@ -31,6 +32,7 @@ def make_live_app(
     box_fraction=0.5,
     theme_manager=None,
     glyph_cache=None,
+    audio=None,
 ) -> LiveApp:
     app = LiveApp.__new__(LiveApp)
     app.backbone = backbone
@@ -44,6 +46,10 @@ def make_live_app(
     app._last_similarities = {}
     app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
     app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
+    # enabled=False: no real pygame/audio device dependency in these pure
+    # logic tests; still exercises the real AudioManager fail-soft path
+    # rather than a mock, since it's always a safe no-op either way.
+    app.audio = audio if audio is not None else AudioManager(enabled=False)
     app.camera = None  # never touched by the methods under test
     return app
 
@@ -57,6 +63,29 @@ def enrolled_store(label="mug", dim=384, n=5, seed=100):
         noisy = base + np.random.default_rng(seed + i).normal(scale=0.02, size=dim).astype(np.float32)
         store.add_example(label, noisy / np.linalg.norm(noisy))
     return store
+
+
+def _unit(seed, dim=16):
+    rng = np.random.default_rng(seed)
+    v = rng.normal(size=dim).astype(np.float32)
+    return v / np.linalg.norm(v)
+
+
+class SequenceBackbone:
+    """Returns pre-programmed embeddings in order, one per .embed() call —
+    lets chime-trigger tests control exactly what similarity each
+    process_frame() call sees, without needing pixel-level control over a
+    real/mock backbone's output. Repeats the last embedding if called more
+    times than the sequence has entries."""
+
+    def __init__(self, embeddings):
+        self._embeddings = list(embeddings)
+        self._index = 0
+
+    def embed(self, image, input_is_bgr: bool = True) -> np.ndarray:
+        idx = min(self._index, len(self._embeddings) - 1)
+        self._index += 1
+        return self._embeddings[idx]
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +155,17 @@ class TestConstructorWithFakeCamera:
         app = LiveApp(mock_backbone, PrototypeStore(), theme_manager=theme_mgr, glyph_cache=cache)
         assert app.theme_manager is theme_mgr
         assert app.glyph_cache is cache
+
+    def test_default_audio_manager_is_created(self, monkeypatch, mock_backbone):
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        app = LiveApp(mock_backbone, PrototypeStore())
+        assert isinstance(app.audio, AudioManager)
+
+    def test_injected_audio_manager_is_used(self, monkeypatch, mock_backbone):
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        spy = SpyAudio()
+        app = LiveApp(mock_backbone, PrototypeStore(), audio=spy)
+        assert app.audio is spy
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +269,95 @@ class TestFrameSkipLogic:
         # reasoning already covered at the prototypes.py level) — just a
         # sanity check that live.py actually passes match_mode through.
         assert app_max.last_similarities["mug"] >= app_mean.last_similarities["mug"] - 1e-6
+
+
+# --------------------------------------------------------------------------
+# match_found chime — fires on the transition INTO a known match
+# --------------------------------------------------------------------------
+
+class TestMatchFoundChime:
+    def _store_with_two_classes(self, dim=16):
+        mug_base = _unit(1, dim)
+        bottle_base = _unit(2, dim)
+        store = PrototypeStore()
+        store.add_examples("mug", [mug_base.copy() for _ in range(5)])
+        store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
+        return store, mug_base, bottle_base
+
+    def test_chime_fires_on_unknown_to_known_transition(self):
+        store, mug_base, _ = self._store_with_two_classes()
+        spy = SpyAudio()
+        # unknown, known, known, unknown, known — frame_skip=1 so every
+        # call actually runs inference.
+        backbone = SequenceBackbone([-mug_base, mug_base, mug_base, -mug_base, mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
+
+        for _ in range(5):
+            app.process_frame(make_test_frame())
+
+        assert spy.match_found_calls == 2  # the two unknown->known transitions
+
+    def test_chime_does_not_fire_while_staying_matched_on_same_class(self):
+        store, mug_base, _ = self._store_with_two_classes()
+        spy = SpyAudio()
+        backbone = SequenceBackbone([mug_base, mug_base, mug_base, mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
+
+        for _ in range(4):
+            app.process_frame(make_test_frame())
+
+        assert spy.match_found_calls == 1  # only the initial entry into "known"
+
+    def test_chime_does_not_fire_on_known_to_unknown_transition(self):
+        store, mug_base, _ = self._store_with_two_classes()
+        spy = SpyAudio()
+        backbone = SequenceBackbone([mug_base, -mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
+
+        app.process_frame(make_test_frame())  # known -> chime #1
+        app.process_frame(make_test_frame())  # known -> unknown -> no chime
+
+        assert spy.match_found_calls == 1
+
+    def test_chime_fires_again_when_switching_between_two_known_classes(self):
+        """Switching from a confident match on one class straight to a
+        confident match on a DIFFERENT class should still count as a fresh
+        'match found' — the object in the box genuinely changed."""
+        store, mug_base, bottle_base = self._store_with_two_classes()
+        spy = SpyAudio()
+        backbone = SequenceBackbone([mug_base, mug_base, bottle_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
+
+        app.process_frame(make_test_frame())  # unknown->mug: chime #1
+        app.process_frame(make_test_frame())  # still mug: no chime
+        app.process_frame(make_test_frame())  # mug->bottle: chime #2
+
+        assert spy.match_found_calls == 2
+
+    def test_chime_never_fires_if_nothing_ever_crosses_threshold(self):
+        store, mug_base, _ = self._store_with_two_classes()
+        spy = SpyAudio()
+        backbone = SequenceBackbone([-mug_base, -mug_base, -mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5, audio=spy)
+
+        for _ in range(3):
+            app.process_frame(make_test_frame())
+
+        assert spy.match_found_calls == 0
+
+    def test_chime_respects_frame_skip_not_evaluated_on_held_frames(self):
+        """The chime decision only happens when inference actually runs —
+        held (skipped) frames can't trigger it, same as they can't update
+        last_result/last_similarities."""
+        store, mug_base, _ = self._store_with_two_classes()
+        spy = SpyAudio()
+        backbone = SequenceBackbone([mug_base])  # same embedding every call
+        app = make_live_app(backbone=backbone, store=store, frame_skip=10, threshold=0.5, audio=spy)
+
+        for _ in range(5):  # well within the first frame_skip window
+            app.process_frame(make_test_frame())
+
+        assert spy.match_found_calls == 1  # only the single real inference call
 
 
 # --------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from .backbone import DinoV3Backbone
 from .capture import Camera, GuideBox, compute_guide_box, crop_guide_box, draw_guide_box
 from .prototypes import PrototypeStore
 from .ui import GlyphCache, ThemeManager, apply_theme_vignette, draw_glass_panel, draw_text
+from .audio import AudioManager
 
 # Key codes — plain ASCII / cv2.waitKey(1) & 0xFF values, portable across platforms.
 KEY_CAPTURE = ord(" ")
@@ -76,6 +77,7 @@ class EnrollApp:
         camera: Optional[Camera] = None,
         theme_manager: Optional[ThemeManager] = None,
         glyph_cache: Optional[GlyphCache] = None,
+        audio: Optional[AudioManager] = None,
     ):
         if not label or not label.strip():
             raise ValueError("label must be a non-empty string")
@@ -100,6 +102,10 @@ class EnrollApp:
         # HUD (most tests) doesn't need to know these exist.
         self.theme_manager = theme_manager or ThemeManager()
         self.glyph_cache = glyph_cache or GlyphCache()
+
+        # Audio is fail-soft by construction (see audio.py) — always safe
+        # to default-construct even with no working audio device.
+        self.audio = audio or AudioManager()
 
         # The only line in this whole class that touches real hardware.
         self.camera = camera or Camera()
@@ -199,9 +205,10 @@ class EnrollApp:
             self._captured_embeddings.pop()
 
     def finish(self) -> None:
-        """Commit captured examples to the store and save to disk. Requires
-        at least `min_examples` — raises rather than silently saving a
-        prototype built from too few/noisy examples."""
+        """Commit captured examples to the store and save to disk, then play
+        the enroll_success chime. Requires at least `min_examples` — raises
+        rather than silently saving a prototype built from too few/noisy
+        examples (and rather than playing a "success" sound for a failure)."""
         if self.state != EnrollState.CAPTURING:
             raise RuntimeError(f"Cannot finish in state {self.state}")
         if not self.has_min_examples:
@@ -212,6 +219,7 @@ class EnrollApp:
         self.store.add_examples(self.label, self._captured_embeddings)
         self.store.save(self.store_path)
         self.state = EnrollState.DONE
+        self.audio.play_enroll_success()
 
     def cancel(self) -> None:
         """Abort without saving anything to the store."""

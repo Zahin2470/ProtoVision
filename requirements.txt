@@ -12,5 +12,8 @@ opencv-python>=4.9
 # on that being true forever.
 Pillow>=10.0
 
+# --- Phase 2: ambient audio + SFX (fail-soft — see protovision/audio.py) ---
+pygame>=2.5
+
 # --- dev / testing ---
 pytest>=8.0

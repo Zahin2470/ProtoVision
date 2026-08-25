@@ -4,8 +4,19 @@ DINOv3 weights — same mock-model approach as test_backbone.py, reused here
 so enroll/live tests aren't coupled to real hardware/weights either.
 """
 
+import os
 import sys
 from pathlib import Path
+
+# Must be set before pygame's mixer is ever initialized anywhere in this
+# test session (any test file that constructs a real, non-muted
+# AudioManager — including main.py's cmd_enroll/cmd_live tests — will
+# trigger this). Tells SDL to use a no-op audio backend instead of probing
+# for real hardware, which doesn't exist in this sandbox and could
+# otherwise hang or error unpredictably depending on the environment. Set
+# here (not in test_audio.py) so it's guaranteed to apply regardless of
+# test collection order.
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import numpy as np
 import pytest
@@ -85,3 +96,22 @@ def make_test_frame(width: int = 128, height: int = 128, color=(100, 120, 140), 
     base[:, :] = color
     noise = rng.integers(-15, 15, size=base.shape)
     return np.clip(base.astype(int) + noise, 0, 255).astype(np.uint8)
+
+
+class SpyAudio:
+    """Stand-in for AudioManager that records calls without touching pygame
+    at all — for verifying WHEN enroll.py/live.py decide to play a sound,
+    independent of whether audio playback itself works (that's audio.py's
+    own test file's job)."""
+
+    def __init__(self):
+        self.enroll_success_calls = 0
+        self.match_found_calls = 0
+
+    def play_enroll_success(self) -> bool:
+        self.enroll_success_calls += 1
+        return True
+
+    def play_match_found(self) -> bool:
+        self.match_found_calls += 1
+        return True

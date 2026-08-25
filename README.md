@@ -92,14 +92,14 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **342/342 passing** |
+| 🧪 Strong test coverage | Current test suite reports **396/396 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — all 4 steps complete and tested. Phase 2 — in progress.**
+> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested.**
 
 | Phase | Step | Component | Status |
 |:---:|:---:|---|:---:|
@@ -111,7 +111,7 @@ Example Images
 | 2 | **2** | `ui.py` — glass-panel HUD + cinematic vignette | ✅ Complete & tested |
 | 2 | **3** | `ui.py` — similarity-meter signature visual | ✅ Complete & tested |
 | 2 | **4** | HUD wired into `enroll.py`/`live.py` (panel + meter + vignette + theme key) | ✅ Complete & tested |
-| 2 | **5** | Ambient audio + SFX (fail-soft) | ⏳ Not started |
+| 2 | **5** | `audio.py` — fail-soft SFX + ambient audio, wired into enroll/live | ✅ Complete & tested |
 
 ---
 
@@ -143,10 +143,14 @@ ProtoVision/
 │   ├── capture.py      # Camera wrapper + guide-box geometry/crop
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
 │   ├── live.py         # Live recognition (frame-skip inference + best_match)
-│   └── ui.py            # Visual design system: typography, themes, glass panels, vignette
+│   ├── ui.py            # Visual design system: typography, themes, glass panels, vignette, similarity meter
+│   └── audio.py          # Fail-soft SFX + ambient audio (pygame)
 ├── assets/
-│   └── fonts/           # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
-├── tests/              # Automated tests (342, all passing)
+│   ├── fonts/            # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
+│   └── audio/
+│       ├── sfx/           # enroll_success.wav, match_found.wav
+│       └── music/         # ambient_pad.wav
+├── tests/              # Automated tests (396, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -168,6 +172,13 @@ python main.py live
 
 # with options
 python main.py live --threshold 0.6 --match-mode max --frame-skip 3
+
+# T cycles the theme (dark/light/neon/mono) in either command, live too
+
+# Disable audio entirely (SFX + ambient) — audio already fails silently on
+# its own if pygame or a device isn't available, --mute is for explicitly
+# turning it off regardless
+python main.py live --mute
 
 # See what's enrolled — reads the store only, no camera or backbone needed
 python main.py list
@@ -358,6 +369,42 @@ actual `render_preview()`
   state (empty, waiting, known match, unknown match) before any of the
   above assertions were written
 
+**`audio.py` fail-soft SFX + ambient audio**
+
+- Two layers of testing, deliberately: fail-soft LOGIC (caching, name
+  dispatch, error handling, volume clamping) is tested against a fake
+  pygame double via monkeypatch — same pattern as `FakeCamera` for
+  enroll.py/live.py — so it's fast and doesn't depend on any audio
+  subsystem actually working here. Separately, a small integration check
+  loads the REAL bundled `.wav` files through REAL pygame using SDL's
+  `dummy` audio driver (no physical device needed), the same
+  confidence-building step used for the real Poppins fonts
+- Construction never raises regardless of what fails — pygame not
+  installed, `mixer.init()` erroring (no audio device), a specific sound
+  file missing — tested for each failure mode individually, plus a test
+  that explicitly asserts construction doesn't raise even when everything
+  about audio is broken
+- Sound loading is cached (loaded once, played many times — verified by
+  counting `Sound()` construction calls, not just checking playback
+  worked) and load/playback exceptions are caught without propagating
+- **The threshold-crossing chime logic specifically** (this is the part
+  with real behavior to get right, not just plumbing): a `SequenceBackbone`
+  test double feeds `process_frame()` a scripted sequence of embeddings, so
+  tests can assert the exact call count of the `match_found` chime across
+  unknown→known, known→known (same class, must NOT re-fire), known→unknown
+  (must NOT fire — only entering a match triggers it), known→known-but-a-
+  DIFFERENT-class (must fire again), and confirms the chime decision only
+  evaluates on frames where inference actually ran, not held/skipped ones
+- `enroll.py`'s `finish()` is confirmed to play `enroll_success` exactly
+  once on a successful finish, zero times if `finish()` raises for too few
+  examples, and exactly once whether reached via an explicit finish key or
+  via `capture_example()` auto-finishing at the target count
+- `main.py`'s `--mute` flag and the ambient-audio start/stop lifecycle
+  around `live.py`'s `run()` are tested at the CLI dispatch level too,
+  including that `stop_ambient()` still fires even if `run()` raises (it's
+  in a `finally` block) — the ambient loop shouldn't be left playing
+  forever just because the camera loop crashed
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -380,6 +427,13 @@ The following require the real DINOv3 weights and/or actual hardware:
   a rendered-to-PNG snapshot — every theme was visually checked as a still
   image (see design decision #8), but motion, real lighting, and a real
   background are a different test this sandbox still can't run.
+- **Whether the SFX/ambient audio actually sound good.** They're verified
+  to be valid, click-free, correctly-loading `.wav` files, played through
+  real pygame with SDL's `dummy` driver — which proves they're technically
+  correct, not that they sound pleasant coming out of real speakers.
+  They're also deliberately simple procedural placeholders (see
+  `assets/audio/NOTICE.md`), not a finished sound design — worth an actual
+  listen on your machine, and worth swapping for something better anytime.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -421,12 +475,16 @@ pytest tests/ -v
 Current result:
 
 ```text
-342 tests
-342 passed
+396 tests
+396 passed
 0 failed
 ```
 
-No camera, GPU, or DINOv3 weights are required for the current automated test suite.
+No camera, GPU, or DINOv3 weights are required for the current automated test
+suite. `conftest.py` sets `SDL_AUDIODRIVER=dummy` before any test imports
+pygame, so the audio tests don't need real speakers/an audio device either —
+same "test against the real thing, minus real hardware" approach used for
+DINOv3's embedding shape contract and Poppins' actual glyphs.
 
 ---
 
@@ -584,6 +642,47 @@ recomputed) on skipped frames, exactly like `last_result` already was, so
 the headline prediction and the bar chart underneath it are guaranteed to
 be describing the same instant, not subtly out of sync.
 
+### 13. Generating placeholder audio instead of leaving it silent
+
+There was no way to source real chime/ambient audio from this sandbox (no
+internet access to a sound library, no existing asset to reuse the way the
+real Poppins font files were available locally). Rather than leave
+`assets/audio/` empty with a TODO, `enroll_success.wav`, `match_found.wav`,
+and `ambient_pad.wav` are procedurally generated — plain sine tones with
+fade envelopes (no clicks at note or loop boundaries, verified by checking
+each file starts and ends at zero amplitude) using nothing but numpy and
+Python's stdlib `wave` module. They're deliberately simple placeholders,
+not a finished sound design — see `assets/audio/NOTICE.md` — but they're
+*real, valid, working* files `audio.py` can load today, the same "give you
+something real to build on, not a stub" approach used for bundling Poppins.
+
+### 14. The match_found chime fires on a transition, not a state
+
+An early version of this logic would have played `match_found` every time
+`process_frame()` produced a known result — which, for an object sitting
+still in the guide box, means once every `frame_skip` frames for as long as
+it sits there: a chime storm, not a notification. The actual rule
+implemented is edge-triggered: play only when this inference is known AND
+(the previous one wasn't, OR it was known but for a *different* class).
+Staying matched on the same class never re-fires it; switching from one
+confidently-matched class straight to a different one does. Encoding "only
+on the interesting transition" directly in `process_frame()` (rather than,
+say, debouncing repeated chimes with a timer) means the behavior is exactly
+testable with a scripted sequence of embeddings — see the six
+`TestMatchFoundChime` cases in `tests/test_live.py`, each pinned to a
+specific transition pattern.
+
+### 15. Muting is explicit, not inferred from whether audio "works"
+
+`AudioManager` already fails silently on its own if pygame isn't installed
+or there's no audio device — that's the fail-soft contract. `--mute` is a
+separate, deliberate on/off switch layered on top of that, not a fallback
+for a broken environment. The distinction matters for testing: "audio
+didn't play because it's broken" and "audio didn't play because you asked
+it not to" are different states with different tests (`AudioManager.available`
+vs. `AudioManager.enabled`), and conflating them would make a genuinely
+broken audio setup look identical to an intentionally quiet one.
+
 ---
 
 ## 🗺️ Roadmap
@@ -602,7 +701,7 @@ be describing the same instant, not subtly out of sync.
 - [x] Build glass-panel HUD + cinematic vignette
 - [x] Build the similarity-meter signature visual
 - [x] Wire panel + vignette + meter + theme cycling into enroll.py/live.py's actual HUD
-- [ ] Add ambient audio + SFX (fail-soft)
+- [x] Add ambient audio + SFX (fail-soft)
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -619,11 +718,11 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (342/342 passing).
-**Phase 2 is nearly done:** typography, themes, glass-panel HUD, vignette,
-and the similarity meter are all built, tested, and now actually wired into
-`enroll.py`/`live.py`'s real `render_preview()` — not just standalone
-functions in `ui.py` anymore. Only ambient audio/SFX is left.
+camera-app logic, and CLI — are built and unit tested (396/396 passing).
+**Phase 2 is also complete.** Typography, themes, glass-panel HUD, vignette,
+the similarity meter, and fail-soft SFX/ambient audio are all built, tested,
+and wired into `enroll.py`/`live.py`'s real `render_preview()`/`process_frame()`
+— not standalone, unused functions in `ui.py`/`audio.py` anymore.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -638,10 +737,18 @@ What hasn't happened yet, and can't happen from this sandbox:
   full HUD, was rendered and visually confirmed as a still PNG (see design
   decisions #8, #10, and #11), which is a real check, just not the same one
   as watching it run live
+- No check that the SFX/ambient audio actually sound good through real
+  speakers — they're verified to be valid, click-free, correctly-loading
+  files (see design decision #13), and they're also explicitly simple
+  procedural placeholders, not a finished sound design
 
-Once the Phase 1 hardware checks pass on your machine and audio (the last
-piece of Phase 2) is built, this becomes the finished portfolio piece
-described in the original brief.
+Both phases from the original brief are now built and tested. What's left is
+entirely the hardware-dependent verification above (all on your machine, not
+something further sandbox work can substitute for) plus whatever Phase 3
+enrichment ideas from the original brief you'd want to pick from — open-set
+handling polish, per-example match debugging, prototype quality warnings
+during enrollment, export/import a "recognizer pack", or a CPU latency
+benchmark script.
 
 ---
 
