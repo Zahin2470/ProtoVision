@@ -58,6 +58,8 @@ _METER_FONT_SIZE = 13
 _METER_BAR_HEIGHT = 14
 _METER_ROW_GAP = 10
 _ROW_GAP = 10
+_DEBUG_SIZE = 12
+_DEBUG_GAP = 3
 
 
 class LiveExitReason(Enum):
@@ -100,6 +102,7 @@ class LiveApp:
         self._last_similarities: Dict[str, float] = {}
         self._unknown_streak = 0
         self._teach_me_requested = False
+        self._matched_example_index: Optional[int] = None
 
         # Visual design system (Phase 2) — defaulted rather than required,
         # so anything constructing a LiveApp without caring about the HUD
@@ -140,6 +143,15 @@ class LiveApp:
         offer the 'teach me?' prompt instead of a plain 'unknown' label."""
         return self._unknown_streak >= UNKNOWN_STREAK_THRESHOLD
 
+    @property
+    def matched_example_index(self) -> Optional[int]:
+        """Which stored example (0-indexed) of the current winning class
+        the embedding matched closest to — Phase 3's match-debugging view,
+        useful for spotting a single noisy/bad capture hiding behind an
+        otherwise fine class prototype. None whenever there's no known
+        match right now (unknown, or no inference has run yet)."""
+        return self._matched_example_index
+
     def _should_run_inference(self) -> bool:
         # Always infer on the very first frame (no prior result to hold),
         # then every `frame_skip`-th frame after that.
@@ -164,7 +176,11 @@ class LiveApp:
 
         Also tracks `unknown_streak` — consecutive unknown inferences —
         which drives the open-set "want to teach me?" HUD prompt once it's
-        sustained rather than a single low-confidence blip.
+        sustained rather than a single low-confidence blip. And, on a known
+        match, looks up exactly which stored example of the winning class
+        was closest (`matched_example_index`) — independent of whichever
+        mode actually decided the match — for the "which capture matched"
+        debug view.
         """
         run_inference = self._should_run_inference()
 
@@ -187,8 +203,12 @@ class LiveApp:
 
             if new_result.is_known:
                 self._unknown_streak = 0
+                self._matched_example_index, _ = self.store.best_example_for_class(
+                    new_result.label, embedding
+                )
             else:
                 self._unknown_streak += 1
+                self._matched_example_index = None
 
             self._last_result = new_result
 
@@ -241,6 +261,18 @@ class LiveApp:
             label_text = "unknown"
             label_color = theme.accent_unknown
 
+        # Phase 3 match-debugging: which specific stored capture matched,
+        # not just which class — helps spot a single bad/noisy example
+        # hiding behind an otherwise-fine prototype. Only shown on an
+        # actual known match; there's nothing meaningful to debug about an
+        # "unknown" result.
+        debug_text = None
+        if is_known and self._matched_example_index is not None:
+            total = self.store.example_count(result.label)
+            debug_text = f"closest: capture {self._matched_example_index + 1} of {total}"
+        debug_h = cache.line_height("regular", _DEBUG_SIZE) if debug_text else 0
+        debug_gap = _DEBUG_GAP if debug_text else 0
+
         # Stable alphabetical order rather than sorted-by-score: a ranked
         # order looks nice but causes rows to visibly swap places whenever
         # two close scores cross each other frame to frame (see ui.py's
@@ -250,7 +282,9 @@ class LiveApp:
             len(meter_entries), bar_height=_METER_BAR_HEIGHT, row_gap=_METER_ROW_GAP
         )
         title_h = cache.line_height("medium", _TITLE_SIZE)
-        panel_height = _PANEL_PAD * 2 + title_h + _ROW_GAP + meter_h
+        panel_height = (
+            _PANEL_PAD * 2 + title_h + debug_gap + debug_h + _ROW_GAP + meter_h
+        )
 
         out = draw_glass_panel(out, _PANEL_X, _PANEL_Y, _PANEL_WIDTH, panel_height, theme, radius=16)
 
@@ -260,8 +294,17 @@ class LiveApp:
             out, cache, label_text, text_x, text_y,
             weight="medium", size=_TITLE_SIZE, color=label_color,
         )
+        text_y += title_h
 
-        text_y += title_h + _ROW_GAP
+        if debug_text:
+            text_y += debug_gap
+            out = draw_text(
+                out, cache, debug_text, text_x, text_y,
+                weight="regular", size=_DEBUG_SIZE, color=theme.text_secondary,
+            )
+            text_y += debug_h
+
+        text_y += _ROW_GAP
         out = draw_similarity_meter(
             out, text_x, text_y, meter_entries, theme, cache,
             threshold=self.threshold,

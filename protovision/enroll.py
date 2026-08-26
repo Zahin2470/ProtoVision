@@ -27,8 +27,8 @@ import numpy as np
 
 from .backbone import DinoV3Backbone
 from .capture import Camera, GuideBox, compute_guide_box, crop_guide_box, draw_guide_box
-from .prototypes import PrototypeStore
-from .ui import GlyphCache, ThemeManager, apply_theme_vignette, draw_glass_panel, draw_text
+from .prototypes import PrototypeStore, cosine_similarity
+from .ui import GlyphCache, ThemeManager, apply_theme_vignette, draw_glass_panel, draw_text, truncate_to_width
 from .audio import AudioManager
 
 # Key codes — plain ASCII / cv2.waitKey(1) & 0xFF values, portable across platforms.
@@ -36,6 +36,15 @@ KEY_CAPTURE = ord(" ")
 KEY_UNDO = ord("u")
 KEY_FINISH = 13  # Enter/Return
 KEY_CANCEL = 27  # Esc
+
+# Phase 3 prototype-quality warnings (advisory only — capture still
+# succeeds either way). Plain module constants, deliberately, since these
+# are exactly the kind of thing that needs recalibrating once real DINOv3
+# similarity distributions can actually be observed on real photos rather
+# than guessed at — see docs/DINOV3_SETUP.md and the design-decision note
+# in README.md.
+QUALITY_DUPLICATE_THRESHOLD = 0.97  # vs. an earlier capture THIS session — "not enough variety"
+QUALITY_CONFUSION_THRESHOLD = 0.75  # vs. a DIFFERENT existing class's prototype — "may get confused"
 
 # HUD layout constants (see render_preview) — plain module-level numbers
 # rather than magic literals scattered through the method.
@@ -45,7 +54,9 @@ _PANEL_PAD = 16
 _TITLE_SIZE = 20
 _PROGRESS_SIZE = 16
 _HINT_SIZE = 13
+_WARNING_SIZE = 12
 _ROW_GAP = 6
+_MAX_WARNING_LINES = 2  # bounds panel height even if multiple things look off at once
 
 
 class EnrollState(Enum):
@@ -95,6 +106,7 @@ class EnrollApp:
         self.box_fraction = box_fraction
 
         self._captured_embeddings: List[np.ndarray] = []
+        self._last_capture_warnings: List[str] = []
         self.state = EnrollState.CAPTURING
 
         # Visual design system (Phase 2) — defaulted rather than required,
@@ -121,14 +133,55 @@ class EnrollApp:
     def has_min_examples(self) -> bool:
         return len(self._captured_embeddings) >= self.min_examples
 
+    @property
+    def last_capture_warnings(self) -> List[str]:
+        """Human-readable prototype-quality warnings for the MOST RECENT
+        capture — empty if nothing looked off. Purely advisory (see
+        _check_capture_quality); capture always succeeds regardless.
+        Cleared by undo_last(), since the capture the warnings were about
+        no longer exists once undone."""
+        return self._last_capture_warnings
+
+    def _check_capture_quality(self, embedding: np.ndarray) -> List[str]:
+        """
+        Advisory checks on a just-captured embedding, run BEFORE it's added
+        to `_captured_embeddings` (so "previous captures" below genuinely
+        excludes it): Phase 3's prototype-quality enrichment.
+
+          1. Too similar to an EARLIER capture in this same session — a
+             sign the user didn't actually change the angle/distance/
+             lighting between captures, so the class ends up with less
+             real variety than `target_examples` suggests.
+          2. Too similar to a DIFFERENT class's existing prototype — a
+             sign this object might get confused with something already
+             enrolled, before that confusable prototype ever gets saved.
+
+        Returns a list of short warning strings (possibly empty). Never
+        raises and never blocks the capture — these are warnings, not
+        validation errors; the brief asks to "warn", not "reject".
+        """
+        warnings: List[str] = []
+
+        for i, previous in enumerate(self._captured_embeddings):
+            if cosine_similarity(embedding, previous) >= QUALITY_DUPLICATE_THRESHOLD:
+                warnings.append(f"Like capture #{i + 1} — try a new angle")
+                break  # one duplicate warning is enough; don't spam per near-duplicate
+
+        other_label, other_sim = self.store.closest_other_class(self.label, embedding)
+        if other_label is not None and other_sim >= QUALITY_CONFUSION_THRESHOLD:
+            warnings.append(f"May be confused with '{other_label}'")
+
+        return warnings
+
     def current_guide_box(self, frame: np.ndarray) -> GuideBox:
         return compute_guide_box(frame.shape[1], frame.shape[0], self.box_fraction)
 
     def render_preview(self, frame: np.ndarray) -> np.ndarray:
         """
         Full on-screen HUD: guide box, a themed glass panel with the label
-        being enrolled, capture progress, and key hints, then a cinematic
-        vignette on top of everything.
+        being enrolled, capture progress, key hints, and (Phase 3) up to
+        two prototype-quality warnings for the most recent capture, then a
+        cinematic vignette on top of everything.
         """
         box = self.current_guide_box(frame)
         out = draw_guide_box(frame, box)
@@ -136,11 +189,15 @@ class EnrollApp:
         theme = self.theme_manager.theme
         cache = self.glyph_cache
 
+        warning_lines = self._last_capture_warnings[:_MAX_WARNING_LINES]
+        warning_h = cache.line_height("regular", _WARNING_SIZE) if warning_lines else 0
+
         title_h = cache.line_height("medium", _TITLE_SIZE)
         progress_h = cache.line_height("regular", _PROGRESS_SIZE)
         hint_h = cache.line_height("regular", _HINT_SIZE)
         panel_height = (
             _PANEL_PAD * 2 + title_h + _ROW_GAP + progress_h + _ROW_GAP + hint_h + _ROW_GAP + hint_h
+            + len(warning_lines) * (_ROW_GAP + warning_h)
         )
 
         out = draw_glass_panel(out, _PANEL_X, _PANEL_Y, _PANEL_WIDTH, panel_height, theme, radius=16)
@@ -174,13 +231,30 @@ class EnrollApp:
             weight="regular", size=_HINT_SIZE, color=theme.text_secondary,
         )
 
+        # Advisory quality warnings for the most recent capture — shown in
+        # the "unknown"/caution accent so they read as a heads-up, not an
+        # error, and capped at _MAX_WARNING_LINES so a pathological case
+        # (matches several other classes AND duplicates an earlier capture)
+        # can't blow up the panel to an unbounded height.
+        prev_row_h = hint_h  # the last-drawn row was the second hint line
+        for warning in warning_lines:
+            text_y += prev_row_h + _ROW_GAP
+            display_warning = truncate_to_width(cache, warning, "regular", _WARNING_SIZE, _PANEL_WIDTH - _PANEL_PAD * 2)
+            out = draw_text(
+                out, cache, display_warning, text_x, text_y,
+                weight="regular", size=_WARNING_SIZE, color=theme.accent_unknown,
+            )
+            prev_row_h = warning_h
+
         return apply_theme_vignette(out, theme)
 
     def capture_example(self, frame: np.ndarray) -> np.ndarray:
         """
-        Crop the current guide box out of `frame`, embed it, and store it.
-        Returns the embedding (mainly so callers/tests can inspect it).
-        Auto-finishes once `target_examples` is reached.
+        Crop the current guide box out of `frame`, embed it, check it for
+        quality warnings (too similar to a previous capture, or to a
+        different existing class), then store it. Returns the embedding
+        (mainly so callers/tests can inspect it). Auto-finishes once
+        `target_examples` is reached.
         """
         if self.state != EnrollState.CAPTURING:
             raise RuntimeError(f"Cannot capture in state {self.state}")
@@ -188,6 +262,10 @@ class EnrollApp:
         box = self.current_guide_box(frame)
         crop = crop_guide_box(frame, box)
         embedding = self.backbone.embed(crop)
+
+        # Checked BEFORE appending, so "previous captures" genuinely means
+        # captures before this one, not including it.
+        self._last_capture_warnings = self._check_capture_quality(embedding)
         self._captured_embeddings.append(embedding)
 
         if len(self._captured_embeddings) >= self.target_examples:
@@ -196,13 +274,15 @@ class EnrollApp:
         return embedding
 
     def undo_last(self) -> None:
-        """Drop the most recently captured example. No-op if nothing captured
-        yet, or if the session already finished/cancelled — undo only makes
-        sense mid-capture."""
+        """Drop the most recently captured example, and the quality
+        warnings that were about it (they no longer describe anything that
+        exists). No-op if nothing captured yet, or if the session already
+        finished/cancelled — undo only makes sense mid-capture."""
         if self.state != EnrollState.CAPTURING:
             return
         if self._captured_embeddings:
             self._captured_embeddings.pop()
+            self._last_capture_warnings = []
 
     def finish(self) -> None:
         """Commit captured examples to the store and save to disk, then play

@@ -18,7 +18,7 @@ from protovision.prototypes import PrototypeStore, MatchResult
 from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
 from protovision.audio import AudioManager
 
-from conftest import make_test_frame, FakeCamera, SpyAudio
+from conftest import make_test_frame, FakeCamera, SpyAudio, unit_embedding as _unit, SequenceBackbone
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
@@ -46,6 +46,7 @@ def make_live_app(
     app._last_similarities = {}
     app._unknown_streak = 0
     app._teach_me_requested = False
+    app._matched_example_index = None
     app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
     app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
     # enabled=False: no real pygame/audio device dependency in these pure
@@ -65,29 +66,6 @@ def enrolled_store(label="mug", dim=384, n=5, seed=100):
         noisy = base + np.random.default_rng(seed + i).normal(scale=0.02, size=dim).astype(np.float32)
         store.add_example(label, noisy / np.linalg.norm(noisy))
     return store
-
-
-def _unit(seed, dim=16):
-    rng = np.random.default_rng(seed)
-    v = rng.normal(size=dim).astype(np.float32)
-    return v / np.linalg.norm(v)
-
-
-class SequenceBackbone:
-    """Returns pre-programmed embeddings in order, one per .embed() call —
-    lets chime-trigger tests control exactly what similarity each
-    process_frame() call sees, without needing pixel-level control over a
-    real/mock backbone's output. Repeats the last embedding if called more
-    times than the sequence has entries."""
-
-    def __init__(self, embeddings):
-        self._embeddings = list(embeddings)
-        self._index = 0
-
-    def embed(self, image, input_is_bgr: bool = True) -> np.ndarray:
-        idx = min(self._index, len(self._embeddings) - 1)
-        self._index += 1
-        return self._embeddings[idx]
 
 
 # --------------------------------------------------------------------------
@@ -272,6 +250,7 @@ class TestFrameSkipLogic:
         # sanity check that live.py actually passes match_mode through.
         assert app_max.last_similarities["mug"] >= app_mean.last_similarities["mug"] - 1e-6
 
+
 def store_with_two_classes(dim=16):
     mug_base = _unit(1, dim)
     bottle_base = _unit(2, dim)
@@ -279,6 +258,60 @@ def store_with_two_classes(dim=16):
     store.add_examples("mug", [mug_base.copy() for _ in range(5)])
     store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
     return store, mug_base, bottle_base
+
+
+# --------------------------------------------------------------------------
+# matched_example_index — Phase 3 match debugging (which capture matched)
+# --------------------------------------------------------------------------
+
+class TestMatchedExampleIndex:
+    def test_starts_none(self):
+        app = make_live_app()
+        assert app.matched_example_index is None
+
+    def test_set_on_known_match(self):
+        store, mug_base, _ = store_with_two_classes()
+        backbone = SequenceBackbone([mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        app.process_frame(make_test_frame())
+        assert app.matched_example_index is not None
+        assert 0 <= app.matched_example_index < store.example_count("mug")
+
+    def test_none_when_unknown(self):
+        store, mug_base, _ = store_with_two_classes()
+        backbone = SequenceBackbone([-mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        app.process_frame(make_test_frame())
+        assert app.matched_example_index is None
+
+    def test_matches_prototypes_best_example_for_class(self):
+        """live.py shouldn't reimplement this search — it should just be
+        calling store.best_example_for_class() and trusting the answer."""
+        store, mug_base, _ = store_with_two_classes()
+        backbone = SequenceBackbone([mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        app.process_frame(make_test_frame())
+        expected_idx, _ = store.best_example_for_class("mug", mug_base)
+        assert app.matched_example_index == expected_idx
+
+    def test_resets_to_none_on_transition_to_unknown(self):
+        store, mug_base, _ = store_with_two_classes()
+        backbone = SequenceBackbone([mug_base, -mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=1, threshold=0.5)
+        app.process_frame(make_test_frame())
+        assert app.matched_example_index is not None
+        app.process_frame(make_test_frame())
+        assert app.matched_example_index is None
+
+    def test_not_updated_on_held_skipped_frames(self):
+        store, mug_base, _ = store_with_two_classes()
+        backbone = SequenceBackbone([mug_base])
+        app = make_live_app(backbone=backbone, store=store, frame_skip=10, threshold=0.5)
+        app.process_frame(make_test_frame())
+        first = app.matched_example_index
+        for _ in range(4):  # within the same frame_skip window
+            app.process_frame(make_test_frame())
+        assert app.matched_example_index == first
 
 
 # --------------------------------------------------------------------------
@@ -541,6 +574,52 @@ class TestPreviewAndQuit:
         # Sanity: render succeeds and doesn't crash trying to show both states at once.
         out = app.render_preview(frame)
         assert out.shape == frame.shape
+
+    def test_render_preview_differs_with_and_without_matched_example_debug_line(self):
+        """Same known-match result, only matched_example_index differs —
+        the panel should grow/change to show the debug line."""
+        store, mug_base, _ = store_with_two_classes()
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+
+        without_debug = make_live_app(store=store)
+        without_debug._last_result = MatchResult(label="mug", similarity=0.9, is_known=True)
+        without_debug._last_similarities = {"mug": 0.9, "bottle": 0.1}
+        without_debug._matched_example_index = None
+
+        with_debug = make_live_app(store=store)
+        with_debug._last_result = MatchResult(label="mug", similarity=0.9, is_known=True)
+        with_debug._last_similarities = {"mug": 0.9, "bottle": 0.1}
+        with_debug._matched_example_index = 2
+
+        out_without = without_debug.render_preview(frame)
+        out_with = with_debug.render_preview(frame)
+        assert out_without.shape == out_with.shape  # both still valid frames
+        assert not np.array_equal(out_without, out_with)
+
+    def test_render_preview_no_debug_line_when_unknown(self):
+        """Even with a stale matched_example_index left over from a
+        previous known match, an unknown result shouldn't show the debug
+        line — process_frame() clears it, but render_preview() shouldn't
+        rely solely on that; it gates on is_known too."""
+        store, mug_base, _ = store_with_two_classes()
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+
+        app = make_live_app(store=store)
+        app._last_result = MatchResult(label=None, similarity=0.2, is_known=False)
+        app._last_similarities = {"mug": 0.2, "bottle": 0.1}
+        app._matched_example_index = 3  # stale value, should be ignored
+
+        # Compare against a version with matched_example_index=None — if
+        # render_preview correctly gates on is_known, these should render
+        # IDENTICALLY despite the stale index being set.
+        app_clean = make_live_app(store=store)
+        app_clean._last_result = MatchResult(label=None, similarity=0.2, is_known=False)
+        app_clean._last_similarities = {"mug": 0.2, "bottle": 0.1}
+        app_clean._matched_example_index = None
+
+        out = app.render_preview(frame)
+        out_clean = app_clean.render_preview(frame)
+        np.testing.assert_array_equal(out, out_clean)
 
     def test_render_preview_respects_active_theme(self, mock_backbone):
         store = enrolled_store("mug")

@@ -31,7 +31,7 @@ from protovision.prototypes import PrototypeStore
 from protovision.ui import ThemeManager, GlyphCache, KEY_THEME_TOGGLE
 from protovision.audio import AudioManager
 
-from conftest import make_test_frame, FakeCamera, SpyAudio
+from conftest import make_test_frame, FakeCamera, SpyAudio, unit_embedding, SequenceBackbone
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
@@ -60,6 +60,7 @@ def make_enroll_app(
     app.min_examples = min_examples
     app.box_fraction = box_fraction
     app._captured_embeddings = list(captured) if captured else []
+    app._last_capture_warnings = []
     app.state = state
     app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
     app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
@@ -236,6 +237,125 @@ class TestCaptureExample:
         app = make_enroll_app(backbone=mock_backbone, state=EnrollState.DONE)
         with pytest.raises(RuntimeError):
             app.capture_example(make_test_frame())
+
+
+# --------------------------------------------------------------------------
+# Phase 3: prototype-quality warnings (duplicate captures, confusable classes)
+# --------------------------------------------------------------------------
+
+class TestCaptureQuality:
+    def test_first_capture_never_warns(self):
+        base = unit_embedding(1, dim=16)
+        app = make_enroll_app(backbone=SequenceBackbone([base]), target_examples=8)
+        app.capture_example(make_test_frame())
+        assert app.last_capture_warnings == []
+
+    def test_near_identical_capture_warns_duplicate(self):
+        base = unit_embedding(1, dim=16)
+        app = make_enroll_app(backbone=SequenceBackbone([base, base]), target_examples=8)
+        app.capture_example(make_test_frame(seed=1))
+        app.capture_example(make_test_frame(seed=2))
+        assert any("capture #1" in w for w in app.last_capture_warnings)
+
+    def test_varied_captures_do_not_warn_duplicate(self):
+        base1 = unit_embedding(1, dim=16)
+        base2 = unit_embedding(2, dim=16)  # unrelated random vector, low similarity
+        app = make_enroll_app(backbone=SequenceBackbone([base1, base2]), target_examples=8)
+        app.capture_example(make_test_frame(seed=1))
+        app.capture_example(make_test_frame(seed=2))
+        assert app.last_capture_warnings == []
+
+    def test_duplicate_warning_only_checked_against_earlier_captures_not_itself(self):
+        """The embedding just captured shouldn't be compared against
+        itself — _check_capture_quality runs before it's appended."""
+        base = unit_embedding(1, dim=16)
+        app = make_enroll_app(backbone=SequenceBackbone([base]), target_examples=8)
+        app.capture_example(make_test_frame())  # only one capture ever — nothing to compare against
+        assert app.last_capture_warnings == []
+
+    def test_confusable_with_other_enrolled_class_warns(self):
+        bottle_base = unit_embedding(2, dim=16)
+        store = PrototypeStore()
+        store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
+        app = make_enroll_app(
+            label="mug", store=store, backbone=SequenceBackbone([bottle_base]), target_examples=8,
+        )
+        app.capture_example(make_test_frame())
+        assert any("bottle" in w for w in app.last_capture_warnings)
+
+    def test_dissimilar_from_other_classes_does_not_warn(self):
+        bottle_base = unit_embedding(2, dim=16)
+        mug_base = unit_embedding(1, dim=16)
+        store = PrototypeStore()
+        store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
+        app = make_enroll_app(
+            label="mug", store=store, backbone=SequenceBackbone([mug_base]), target_examples=8,
+        )
+        app.capture_example(make_test_frame())
+        assert app.last_capture_warnings == []
+
+    def test_resuming_own_class_does_not_self_warn(self):
+        """Enrolling more examples into a class that already has stored
+        examples (e.g. a second enrollment session for 'mug') shouldn't
+        warn that the new capture is 'confusable with mug' — that's not a
+        different class, it's the same one."""
+        mug_base = unit_embedding(1, dim=16)
+        store = PrototypeStore()
+        store.add_examples("mug", [mug_base.copy() for _ in range(5)])
+        app = make_enroll_app(
+            label="mug", store=store, backbone=SequenceBackbone([mug_base]), target_examples=8,
+        )
+        app.capture_example(make_test_frame())
+        assert app.last_capture_warnings == []
+
+    def test_both_warnings_can_appear_together(self):
+        bottle_base = unit_embedding(2, dim=16)
+        store = PrototypeStore()
+        store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
+        # captured[0] is also bottle_base, so the 2nd capture is BOTH a
+        # near-duplicate of capture #1 AND confusable with "bottle".
+        app = make_enroll_app(
+            label="mug", store=store,
+            backbone=SequenceBackbone([bottle_base, bottle_base]), target_examples=8,
+        )
+        app.capture_example(make_test_frame(seed=1))
+        app.capture_example(make_test_frame(seed=2))
+        warnings = app.last_capture_warnings
+        assert len(warnings) == 2
+        assert any("capture #1" in w for w in warnings)
+        assert any("bottle" in w for w in warnings)
+
+    def test_capture_still_succeeds_despite_warnings(self):
+        """Warnings are advisory, not blocking — the brief says 'warn', not
+        'reject'. The capture must still be stored either way."""
+        base = unit_embedding(1, dim=16)
+        app = make_enroll_app(backbone=SequenceBackbone([base, base]), target_examples=8)
+        app.capture_example(make_test_frame(seed=1))
+        app.capture_example(make_test_frame(seed=2))
+        assert app.progress == (2, 8)  # both captures counted, warning or not
+
+    def test_warnings_reflect_only_the_most_recent_capture(self):
+        base1 = unit_embedding(1, dim=16)
+        base2 = unit_embedding(2, dim=16)
+        app = make_enroll_app(backbone=SequenceBackbone([base1, base1, base2]), target_examples=8)
+        app.capture_example(make_test_frame(seed=1))  # no warning (first capture)
+        app.capture_example(make_test_frame(seed=2))  # warns: duplicate of #1
+        assert app.last_capture_warnings != []
+        app.capture_example(make_test_frame(seed=3))  # base2 is unrelated — no warning
+        assert app.last_capture_warnings == []
+
+    def test_undo_clears_warnings(self):
+        base = unit_embedding(1, dim=16)
+        app = make_enroll_app(backbone=SequenceBackbone([base, base]), target_examples=8)
+        app.capture_example(make_test_frame(seed=1))
+        app.capture_example(make_test_frame(seed=2))
+        assert app.last_capture_warnings != []
+        app.undo_last()
+        assert app.last_capture_warnings == []
+
+    def test_warnings_start_empty(self):
+        app = make_enroll_app()
+        assert app.last_capture_warnings == []
 
 
 # --------------------------------------------------------------------------
@@ -491,3 +611,41 @@ class TestPreviewHelpers:
         out_not_ready = not_ready.render_preview(frame)
         out_ready = ready.render_preview(frame)
         assert not np.array_equal(out_not_ready, out_ready)
+
+    def test_render_preview_grows_panel_for_warnings(self):
+        """Same everything else, only last_capture_warnings differs — the
+        panel should visibly change (it grows to fit the warning line)."""
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+        cache = GlyphCache(font_dir=FONT_DIR)
+
+        no_warning = make_enroll_app(glyph_cache=cache)
+        with_warning = make_enroll_app(glyph_cache=cache)
+        with_warning._last_capture_warnings = ["Like capture #1 — try a new angle"]
+
+        out_plain = no_warning.render_preview(frame)
+        out_warned = with_warning.render_preview(frame)
+        assert out_plain.shape != out_warned.shape or not np.array_equal(out_plain, out_warned)
+
+    def test_render_preview_caps_at_two_warning_lines(self):
+        """More than _MAX_WARNING_LINES warnings shouldn't keep growing the
+        panel indefinitely — rendering with 2 vs. 3+ warnings should
+        produce identical output, since only the first 2 are ever shown."""
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+        cache = GlyphCache(font_dir=FONT_DIR)
+
+        two = make_enroll_app(glyph_cache=cache)
+        two._last_capture_warnings = ["Warning one", "Warning two"]
+
+        three = make_enroll_app(glyph_cache=cache)
+        three._last_capture_warnings = ["Warning one", "Warning two", "Warning three"]
+
+        out_two = two.render_preview(frame)
+        out_three = three.render_preview(frame)
+        np.testing.assert_array_equal(out_two, out_three)
+
+    def test_render_preview_no_warning_lines_when_empty(self):
+        frame = make_test_frame(width=400, height=300, color=(30, 30, 30))
+        app = make_enroll_app()
+        app._last_capture_warnings = []
+        out = app.render_preview(frame)
+        assert out.shape == frame.shape  # renders fine, no crash, no extra rows

@@ -315,6 +315,111 @@ class TestAllSimilarities:
 
 
 # --------------------------------------------------------------------------
+# PrototypeStore — best_example_for_class (Phase 3: match debugging)
+# --------------------------------------------------------------------------
+
+class TestBestExampleForClass:
+    def test_missing_class_returns_none_and_neg_inf(self):
+        store = PrototypeStore()
+        idx, sim = store.best_example_for_class("ghost", unit_vector(1))
+        assert idx is None
+        assert sim == float("-inf")
+
+    def test_single_example_matches_itself_exactly(self):
+        store = PrototypeStore()
+        v = unit_vector(1, dim=8)
+        store.add_example("mug", v)
+        idx, sim = store.best_example_for_class("mug", v)
+        assert idx == 0
+        assert sim == pytest.approx(1.0, abs=1e-6)
+
+    def test_picks_the_closest_of_several_examples(self):
+        store = PrototypeStore()
+        base = unit_vector(1, dim=16)
+        # Five examples: only index 3 is a close jitter of `base`; the rest
+        # are unrelated random vectors, so index 3 should always win.
+        for i in range(5):
+            if i == 3:
+                store.add_example("mug", jittered(base, 0.02, seed=999))
+            else:
+                store.add_example("mug", unit_vector(1000 + i, dim=16))
+        idx, sim = store.best_example_for_class("mug", base)
+        assert idx == 3
+        assert sim > 0.9
+
+    def test_only_considers_examples_of_the_requested_class(self):
+        store = PrototypeStore()
+        base = unit_vector(1, dim=16)
+        store.add_example("mug", jittered(base, 0.1, seed=1))
+        store.add_example("bottle", base.copy())  # exact match, but wrong class
+        idx, sim = store.best_example_for_class("mug", base)
+        # Only "mug" has any examples to search — index 0 necessarily means
+        # its single (jittered, not exact) example was picked, proving
+        # "bottle"'s exact-match example was never a candidate at all.
+        assert idx == 0
+
+    def test_index_is_stable_capture_order_not_similarity_order(self):
+        store = PrototypeStore()
+        base = unit_vector(1, dim=16)
+        store.add_example("mug", unit_vector(2000, dim=16))  # index 0: unrelated
+        store.add_example("mug", jittered(base, 0.02, seed=1))  # index 1: close match
+        idx, _ = store.best_example_for_class("mug", base)
+        assert idx == 1
+
+
+# --------------------------------------------------------------------------
+# PrototypeStore — closest_other_class (Phase 3: prototype-quality warnings)
+# --------------------------------------------------------------------------
+
+class TestClosestOtherClass:
+    def test_no_other_classes_returns_none_and_neg_inf(self):
+        store = PrototypeStore()
+        store.add_example("mug", unit_vector(1))
+        label, sim = store.closest_other_class("mug", unit_vector(1))
+        assert label is None
+        assert sim == float("-inf")
+
+    def test_empty_store_returns_none(self):
+        store = PrototypeStore()
+        label, sim = store.closest_other_class("mug", unit_vector(1))
+        assert label is None
+
+    def test_finds_the_closest_other_class(self):
+        store, base_mug, base_bottle = self._three_class_store()
+        # a query close to "bottle" should report "bottle" as closest,
+        # even though "mug" is being enrolled right now (excluded=self,
+        # but bottle/keys are still real candidates).
+        query = jittered(base_bottle, 0.02, seed=42)
+        label, sim = store.closest_other_class("mug", query)
+        assert label == "bottle"
+        assert sim > 0.9
+
+    def test_excludes_the_given_label_even_if_it_has_examples(self):
+        store, base_mug, _ = self._three_class_store()
+        # querying with something that matches "mug" itself almost
+        # perfectly should NOT report "mug" back — it's excluded by design.
+        label, sim = store.closest_other_class("mug", base_mug)
+        assert label != "mug"
+
+    def test_returns_none_when_only_excluded_label_exists(self):
+        store = PrototypeStore()
+        store.add_example("mug", unit_vector(1))
+        label, sim = store.closest_other_class("mug", unit_vector(1))
+        assert label is None
+        assert sim == float("-inf")
+
+    def _three_class_store(self, dim=16):
+        store = PrototypeStore()
+        base_mug = unit_vector(1, dim)
+        base_bottle = unit_vector(2, dim)
+        base_keys = unit_vector(3, dim)
+        store.add_examples("mug", [jittered(base_mug, 0.02, seed=i) for i in range(5)])
+        store.add_examples("bottle", [jittered(base_bottle, 0.02, seed=100 + i) for i in range(5)])
+        store.add_examples("keys", [jittered(base_keys, 0.02, seed=200 + i) for i in range(5)])
+        return store, base_mug, base_bottle
+
+
+# --------------------------------------------------------------------------
 # PrototypeStore — save/load persistence
 # --------------------------------------------------------------------------
 

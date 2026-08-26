@@ -40,7 +40,7 @@ from protovision.ui import (
     _rounded_rect_mask,
     _rounded_rect_border_mask,
     _solid_rounded_rect,
-    _truncate_to_width,
+    truncate_to_width,
     _clamp01,
 )
 
@@ -694,31 +694,31 @@ class TestSolidRoundedRect:
 
 class TestTruncateToWidth:
     def test_short_text_is_unchanged(self, cache):
-        result = _truncate_to_width(cache, "mug", "regular", 16, max_width=200)
+        result = truncate_to_width(cache, "mug", "regular", 16, max_width=200)
         assert result == "mug"
 
     def test_empty_string_is_unchanged(self, cache):
-        assert _truncate_to_width(cache, "", "regular", 16, max_width=200) == ""
+        assert truncate_to_width(cache, "", "regular", 16, max_width=200) == ""
 
     def test_long_text_is_shortened(self, cache):
         long_label = "a_very_long_class_name_indeed"
-        result = _truncate_to_width(cache, long_label, "regular", 16, max_width=60)
+        result = truncate_to_width(cache, long_label, "regular", 16, max_width=60)
         assert len(result) < len(long_label)
 
     def test_truncated_text_ends_with_ellipsis(self, cache):
         long_label = "a_very_long_class_name_indeed"
-        result = _truncate_to_width(cache, long_label, "regular", 16, max_width=60)
+        result = truncate_to_width(cache, long_label, "regular", 16, max_width=60)
         assert result.endswith("…")
 
     def test_truncated_text_actually_fits(self, cache):
         long_label = "a_very_long_class_name_indeed"
         max_width = 60
-        result = _truncate_to_width(cache, long_label, "regular", 16, max_width=max_width)
+        result = truncate_to_width(cache, long_label, "regular", 16, max_width=max_width)
         width, _ = cache.measure_text(result, "regular", 16)
         assert width <= max_width
 
     def test_extremely_narrow_width_falls_back_to_bare_ellipsis(self, cache):
-        result = _truncate_to_width(cache, "mug", "regular", 16, max_width=1)
+        result = truncate_to_width(cache, "mug", "regular", 16, max_width=1)
         assert result == "…"
 
 

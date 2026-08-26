@@ -92,7 +92,7 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **418/418 passing** |
+| 🧪 Strong test coverage | Current test suite reports **451/451 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
@@ -113,7 +113,7 @@ Example Images
 | 2 | **4** | HUD wired into `enroll.py`/`live.py` (panel + meter + vignette + theme key) | ✅ Complete & tested |
 | 2 | **5** | `audio.py` — fail-soft SFX + ambient audio, wired into enroll/live | ✅ Complete & tested |
 | 3 | **1** | Open-set polish — sustained "New object? Press N" prompt + live→enroll→live handoff | ✅ Complete & tested |
-| 3 | **2** | Match debugging (which stored example matched + noisy/confusable-enrollment warnings) | ⏳ Not started |
+| 3 | **2** | Match debugging (which stored example matched + noisy/confusable-enrollment warnings) | ✅ Complete & tested |
 | 3 | **3** | Export/import a shareable "recognizer pack" file | ⏳ Not started |
 | 3 | **4** | CPU latency benchmark script | ⏳ Not started |
 
@@ -154,7 +154,7 @@ ProtoVision/
 │   └── audio/
 │       ├── sfx/           # enroll_success.wav, match_found.wav
 │       └── music/         # ambient_pad.wav
-├── tests/              # Automated tests (418, all passing)
+├── tests/              # Automated tests (451, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -438,6 +438,49 @@ actual `render_preview()`
   and the same `ThemeManager` instance is shared across every `LiveApp`/
   `EnrollApp` construction in the handoff, not reset each time
 
+**Phase 3, step 2: match debugging**
+
+- `prototypes.py`'s `best_example_for_class()` — the "which capture
+  actually matched" lookup — is checked for picking the genuinely closest
+  of several examples (not just the first or last), for only ever
+  considering examples of the requested class even when a different
+  class's example is a closer match to the raw query, and that its
+  returned index reflects capture order, not similarity order (index 3
+  can be the winner without indices 0–2 being sorted around it)
+- `prototypes.py`'s `closest_other_class()` — the confusable-class lookup —
+  is checked to always exclude the class passed in, even when that class's
+  own prototype is the closest match to the query (self-similarity isn't a
+  confusion risk); returns `(None, -inf)` rather than raising when there's
+  nothing else to compare against yet (e.g. the very first class being
+  enrolled)
+- `live.py`'s `matched_example_index` is confirmed to come directly from
+  `best_example_for_class()` (not a reimplementation of the same search),
+  reset to `None` on any transition to unknown, and — like
+  `last_similarities` before it — held rather than recomputed on
+  frame-skipped frames
+- The HUD's "closest: capture N of M" subtitle is confirmed to actually
+  change the rendered output when the index changes, and — importantly —
+  confirmed to NOT appear during an unknown result even with a stale
+  non-`None` index left over from a previous known match: two renders
+  (index `None` vs. a stale `3`) under an unknown result are asserted
+  byte-for-byte IDENTICAL, proving `render_preview()` gates on `is_known`
+  rather than just checking whether an index happens to be set
+- `enroll.py`'s duplicate-capture and confusable-class warnings are each
+  tested in isolation (only the relevant condition present) and together
+  (both conditions true in the same capture, both warnings present), plus
+  that a capture always still succeeds regardless of warnings — the brief
+  asks to "warn", not "reject" — and that `undo_last()` clears warnings
+  belonging to the capture it just removed rather than leaving stale text
+  in the HUD
+- The warning panel is confirmed to actually grow to fit 1–2 warning
+  lines, and capped at exactly `_MAX_WARNING_LINES` (2) — rendering with 2
+  vs. 3 warnings queued is asserted to produce byte-identical output, since
+  only the first 2 are ever drawn
+- A small refactor came out of building this: `ui.py`'s `_truncate_to_width`
+  became a public `truncate_to_width`, since both `draw_similarity_meter`
+  and `enroll.py`'s warning-line rendering need the same "fit this text or
+  ellipsize it" behavior — one function, not two near-duplicates
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -474,6 +517,13 @@ The following require the real DINOv3 weights and/or actual hardware:
   or feels natural, and whether `UNKNOWN_STREAK_THRESHOLD`'s default of 3
   inferences feels like the right delay before the prompt appears, are both
   judgment calls that need your eyes and your webcam to settle.
+- **Whether `QUALITY_DUPLICATE_THRESHOLD` (0.97) and
+  `QUALITY_CONFUSION_THRESHOLD` (0.75) are the right numbers.** The
+  *behavior* around them is fully tested (see design decision #18), but the
+  thresholds themselves were picked without ever running real DINOv3 on a
+  real photo — worth watching for false positives/negatives once real
+  weights are in place, and adjusting the two constants at the top of
+  `enroll.py` accordingly.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -515,8 +565,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-418 tests
-418 passed
+451 tests
+451 passed
 0 failed
 ```
 
@@ -755,6 +805,30 @@ resumes live recognition whether the enrollment that followed succeeded or
 was cancelled, so a change of mind mid-flow can't strand the user outside
 the app.
 
+### 18. Quality-warning thresholds are guesses, and say so
+
+`QUALITY_DUPLICATE_THRESHOLD` (0.97) and `QUALITY_CONFUSION_THRESHOLD`
+(0.75) had to be picked without ever having run real DINOv3 on real
+photos in this sandbox — there's no way to empirically calibrate "how
+similar is *too* similar" against a model that can't be loaded here. Both
+are plain module constants in `enroll.py` (not buried in conditional
+logic) specifically so they're easy to find and retune once real
+similarity distributions can actually be observed on your machine — the
+tests lock in the *behavior* around the thresholds (duplicate vs. not,
+confusable vs. not, both together, neither), not the specific numbers, so
+retuning them later won't require rewriting the test suite.
+
+### 19. Warnings are advisory, matching the brief's own wording
+
+The brief says "warn if new examples are too similar" — not "reject" or
+"require redo". `_check_capture_quality()` never raises and never blocks
+`capture_example()`; a duplicate or confusable capture is still stored,
+still counts toward `target_examples`, and can still trigger auto-finish.
+The warning exists so the person enrolling can *choose* to redo a capture
+with more variety, not so the system second-guesses them — same
+philosophy as `NotEnoughExamplesError` only firing on an explicit `finish()`
+below `min_examples`, never on an individual capture.
+
 ---
 
 ## 🗺️ Roadmap
@@ -775,7 +849,7 @@ the app.
 - [x] Wire panel + vignette + meter + theme cycling into enroll.py/live.py's actual HUD
 - [x] Add ambient audio + SFX (fail-soft)
 - [x] Phase 3: open-set polish (sustained "teach me?" prompt + live↔enroll handoff)
-- [ ] Phase 3: match debugging (which stored example matched + confusable-enrollment warnings)
+- [x] Phase 3: match debugging (which stored example matched + confusable-enrollment warnings)
 - [ ] Phase 3: export/import a shareable "recognizer pack" file
 - [ ] Phase 3: CPU latency benchmark script
 - [ ] Measure real CPU inference latency
@@ -794,15 +868,17 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (418/418 passing).
+camera-app logic, and CLI — are built and unit tested (451/451 passing).
 **Phase 2 is complete.** Typography, themes, glass-panel HUD, vignette,
 the similarity meter, and fail-soft SFX/ambient audio are all built, tested,
 and wired into `enroll.py`/`live.py`'s real `render_preview()`/`process_frame()`
 — not standalone, unused functions in `ui.py`/`audio.py` anymore.
 **Phase 3 is in progress**, one pick-a-few enrichment at a time: open-set
 polish (sustained "New object? Press N" prompt, live→enroll→live handoff
-reusing the loaded backbone) is done; match debugging, the recognizer-pack
-export/import, and a CPU latency benchmark script are still on the list.
+reusing the loaded backbone) and match debugging (which stored capture
+matched + duplicate/confusable enrollment warnings) are done; the
+recognizer-pack export/import and a CPU latency benchmark script are still
+on the list.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -825,13 +901,16 @@ What hasn't happened yet, and can't happen from this sandbox:
   transitions between live and enroll, and whether the 3-inference unknown
   threshold before the prompt appears is well-tuned — the loop logic itself
   is tested, that feel isn't
+- No check of whether the two quality-warning thresholds (0.97 duplicate,
+  0.75 confusion) actually fire at sensible moments on real photos — see
+  design decision #18 and the note above
 
 Phases 1 and 2 from the original brief are fully built and tested. Phase 3
-is a pick-a-few menu being worked through one item at a time — three
-enrichment ideas remain (match debugging, recognizer-pack export/import,
-CPU latency benchmark) alongside the hardware-dependent verification above,
-which is entirely on your machine and isn't something further sandbox work
-can substitute for.
+is a pick-a-few menu being worked through one item at a time — two
+enrichment ideas remain (recognizer-pack export/import, CPU latency
+benchmark) alongside the hardware-dependent verification above, which is
+entirely on your machine and isn't something further sandbox work can
+substitute for.
 
 ---
 

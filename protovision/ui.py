@@ -657,10 +657,12 @@ def _solid_rounded_rect(width: int, height: int, radius: int, color: BGRColor, a
     return np.dstack([bgr, a * 255.0]).astype(np.uint8)
 
 
-def _truncate_to_width(cache: GlyphCache, text: str, weight: str, size: int, max_width: int) -> str:
+def truncate_to_width(cache: GlyphCache, text: str, weight: str, size: int, max_width: int) -> str:
     """Shorten `text` with a trailing ellipsis so it fits in `max_width`
-    pixels — protects the layout against arbitrary user-entered class
-    labels running into the bar rather than assuming short names."""
+    pixels — protects layout against arbitrary user-entered class labels
+    (or warning strings that embed one) running past their allotted space.
+    Public: used by draw_similarity_meter here and by enroll.py's
+    prototype-quality warning HUD."""
     width, _ = cache.measure_text(text, weight, size)
     if width <= max_width or not text:
         return text
@@ -745,7 +747,7 @@ def draw_similarity_meter(
         is_known = similarity >= threshold
         accent = theme.accent_known if is_known else theme.accent_unknown
 
-        display_label = _truncate_to_width(glyph_cache, label, font_weight, font_size, label_width - 4)
+        display_label = truncate_to_width(glyph_cache, label, font_weight, font_size, label_width - 4)
         out = draw_text(
             out, glyph_cache, display_label, x, row_y,
             weight=font_weight, size=font_size, color=theme.text_primary,

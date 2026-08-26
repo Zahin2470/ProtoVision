@@ -98,6 +98,35 @@ def make_test_frame(width: int = 128, height: int = 128, color=(100, 120, 140), 
     return np.clip(base.astype(int) + noise, 0, 255).astype(np.uint8)
 
 
+def unit_embedding(seed: int, dim: int = 16) -> np.ndarray:
+    """A deterministic, seeded unit-length vector — a stand-in embedding
+    for tests that need to control exact cosine-similarity relationships
+    (e.g. "this must be a known match", "this must be unknown") rather than
+    relying on a mock backbone's real-but-arbitrary output crossing a
+    threshold by chance."""
+    rng = np.random.default_rng(seed)
+    v = rng.normal(size=dim).astype(np.float32)
+    return v / np.linalg.norm(v)
+
+
+class SequenceBackbone:
+    """Returns pre-programmed embeddings in order, one per .embed() call —
+    lets a test control exactly what embedding (and therefore what
+    similarity) each process_frame()/capture_example() call sees, without
+    needing pixel-level control over a real/mock backbone's output.
+    Repeats the last embedding if called more times than the sequence has
+    entries."""
+
+    def __init__(self, embeddings):
+        self._embeddings = list(embeddings)
+        self._index = 0
+
+    def embed(self, image, input_is_bgr: bool = True) -> np.ndarray:
+        idx = min(self._index, len(self._embeddings) - 1)
+        self._index += 1
+        return self._embeddings[idx]
+
+
 class SpyAudio:
     """Stand-in for AudioManager that records calls without touching pygame
     at all — for verifying WHEN enroll.py/live.py decide to play a sound,

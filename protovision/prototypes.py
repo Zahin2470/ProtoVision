@@ -178,6 +178,59 @@ class PrototypeStore:
 
         return results
 
+    def best_example_for_class(self, label: str, embedding: np.ndarray) -> Tuple[Optional[int], float]:
+        """
+        Which stored example of `label` is closest to `embedding`, and how
+        close — the "which crop actually matched" debug view behind
+        best_match()'s single winning label. Independent of whichever mode
+        (`mean`/`max`) decided the match itself: even a `mean`-mode
+        decision benefits from being able to show "closest to capture #3 of
+        8" when troubleshooting a bad/noisy prototype (Phase 3's
+        match-debugging enrichment).
+
+        Returns (None, -inf) if `label` has no stored examples, rather than
+        raising — a caller asking "what matched" about a class with nothing
+        enrolled yet is a normal question with a normal "nothing" answer.
+        """
+        examples = self._classes.get(label)
+        if not examples:
+            return None, float("-inf")
+
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        best_index: Optional[int] = None
+        best_sim = float("-inf")
+        for idx, ex in enumerate(examples):
+            sim = cosine_similarity(embedding, ex)
+            if sim > best_sim:
+                best_sim, best_index = sim, idx
+        return best_index, best_sim
+
+    def closest_other_class(
+        self, label: str, embedding: np.ndarray
+    ) -> Tuple[Optional[str], float]:
+        """
+        Among every class OTHER than `label`, which one is `embedding`
+        closest to, and how close — used during enrollment to warn "this
+        new capture looks a lot like your enrolled 'X' class" before a
+        confusable prototype gets saved (Phase 3's prototype-quality
+        enrichment). `label` itself is excluded even if it already has
+        stored examples, since comparing a class against itself isn't a
+        confusion risk.
+
+        Returns (None, -inf) if there are no OTHER classes to compare
+        against yet (e.g. this is the very first class being enrolled).
+        """
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        best_label: Optional[str] = None
+        best_sim = float("-inf")
+        for other_label, proto in self.all_prototypes().items():
+            if other_label == label:
+                continue
+            sim = cosine_similarity(embedding, proto)
+            if sim > best_sim:
+                best_sim, best_label = sim, other_label
+        return best_label, best_sim
+
     # -- persistence -----------------------------------------------------
 
     def save(self, path: PathLike) -> None:
