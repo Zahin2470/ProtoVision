@@ -92,7 +92,7 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **451/451 passing** |
+| 🧪 Strong test coverage | Current test suite reports **512/512 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
@@ -114,7 +114,7 @@ Example Images
 | 2 | **5** | `audio.py` — fail-soft SFX + ambient audio, wired into enroll/live | ✅ Complete & tested |
 | 3 | **1** | Open-set polish — sustained "New object? Press N" prompt + live→enroll→live handoff | ✅ Complete & tested |
 | 3 | **2** | Match debugging (which stored example matched + noisy/confusable-enrollment warnings) | ✅ Complete & tested |
-| 3 | **3** | Export/import a shareable "recognizer pack" file | ⏳ Not started |
+| 3 | **3** | Export/import a shareable "recognizer pack" file | ✅ Complete & tested |
 | 3 | **4** | CPU latency benchmark script | ⏳ Not started |
 
 ---
@@ -140,7 +140,7 @@ flowchart LR
 
 ```text
 ProtoVision/
-├── main.py             # CLI entry point (enroll / live / list)
+├── main.py             # CLI entry point (enroll / live / list / export / import)
 ├── protovision/
 │   ├── backbone.py     # DINOv3 loading + embedding extraction
 │   ├── prototypes.py   # Prototype storage + similarity matching
@@ -148,13 +148,14 @@ ProtoVision/
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
 │   ├── live.py         # Live recognition (frame-skip inference + best_match)
 │   ├── ui.py            # Visual design system: typography, themes, glass panels, vignette, similarity meter
-│   └── audio.py          # Fail-soft SFX + ambient audio (pygame)
+│   ├── audio.py          # Fail-soft SFX + ambient audio (pygame)
+│   └── pack.py            # Export/import a shareable "recognizer pack"
 ├── assets/
 │   ├── fonts/            # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
 │   └── audio/
 │       ├── sfx/           # enroll_success.wav, match_found.wav
 │       └── music/         # ambient_pad.wav
-├── tests/              # Automated tests (451, all passing)
+├── tests/              # Automated tests (512, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -191,6 +192,20 @@ python main.py live --mute
 
 # See what's enrolled — reads the store only, no camera or backbone needed
 python main.py list
+
+# Export enrolled classes as a shareable "recognizer pack" file — everything
+# by default, or just the classes you name
+python main.py export my_pack.json
+python main.py export my_pack.json --label mug --label bottle
+
+# Preview a pack's contents without importing anything
+python main.py import my_pack.json --info
+
+# Import a pack's classes into your current store. A class that already
+# exists locally is skipped by default — --on-conflict merge appends the
+# pack's examples to it instead, --on-conflict overwrite replaces it
+python main.py import my_pack.json
+python main.py import my_pack.json --on-conflict merge
 ```
 
 `enroll`/`live` both need the real DINOv3 repo + weights in place first (see
@@ -481,6 +496,39 @@ actual `render_preview()`
   and `enroll.py`'s warning-line rendering need the same "fit this text or
   ellipsize it" behavior — one function, not two near-duplicates
 
+**Phase 3, step 3: recognizer-pack export/import**
+
+- `export_pack()`/`import_pack()` round-trip tested end to end: export a
+  store, import into a fresh one, and confirm `best_match()` behaves
+  *identically* on both (not just "the numbers look similar") — same
+  winning label, same similarity score to within floating-point tolerance
+- Compatibility handling tested as two genuinely different cases, on
+  purpose: an embedding-dimension mismatch is a hard `PackIncompatibleError`
+  (embeddings from different backbones aren't comparable, full stop), while
+  a `model_name` mismatch only produces a warning in the returned
+  `ImportSummary` and the import still proceeds — dimension is what
+  actually determines compatibility, name is just a hint
+- All three `on_conflict` policies (`skip`/`merge`/`overwrite`) tested for
+  a class that already exists locally, plus that a class NOT already
+  present is always added regardless of the policy — there's no conflict
+  to resolve for a brand-new class, so the policy shouldn't matter there
+- A dedicated sanity check that the four outcome lists on `ImportSummary`
+  (`added`/`merged`/`overwritten`/`skipped`) are mutually exclusive per
+  class — no class should ever be able to appear in two of them at once
+- Pack-format validation tested against several kinds of bad input, not
+  just "file missing": invalid JSON, a JSON array instead of an object,
+  missing required fields, an unsupported format version, and — a
+  deliberate edge case — confirming a bare `prototypes.json` (a real file
+  format in this project, just a different one) is correctly REJECTED as
+  an invalid pack rather than silently misread, since the two formats look
+  superficially similar but aren't interchangeable
+- `main.py`'s `export`/`import`/`import --info` are tested directly with no
+  mocking at all (same as `list` — these commands never touch a camera or
+  backbone), including that a `skip`-only import that changes nothing
+  doesn't rewrite the store file on disk (checked via the file's
+  modification time), and that `export`/`import` don't expose irrelevant
+  flags like `--device`/`--mute` that only `enroll`/`live` need
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -565,8 +613,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-451 tests
-451 passed
+512 tests
+512 passed
 0 failed
 ```
 
@@ -829,6 +877,37 @@ with more variety, not so the system second-guesses them — same
 philosophy as `NotEnoughExamplesError` only firing on an explicit `finish()`
 below `min_examples`, never on an individual capture.
 
+### 20. A pack merges by default; it doesn't replace
+
+The simplest possible `import` would just overwrite the local store with
+whatever the pack contains. That's a bad default for something explicitly
+meant to be *shared* — the whole point of a recognizer pack is combining
+someone else's enrolled classes with your own, not clobbering your own
+work every time you bring in someone else's. `import_pack()` mutates the
+target store IN PLACE, adds any class not already present unconditionally,
+and only asks `on_conflict` to make a decision for classes that actually
+collide — defaulting to `skip` (the least destructive option: nothing
+existing is ever touched unless you explicitly ask for `merge` or
+`overwrite`). `import_pack()` also doesn't save to disk itself — same
+division of responsibility as the rest of `PrototypeStore`'s API — so
+`main.py`'s `cmd_import` decides when persisting actually happens, and
+skips the write entirely if nothing changed.
+
+### 21. Dimension mismatch is an error; model-name mismatch is a warning
+
+These two checks look similar but aren't the same kind of problem.
+Embedding dimension is a hard mathematical fact — a 384-dim vector and a
+16-dim vector can't be compared by cosine similarity at all, so importing
+across a dimension mismatch wouldn't just be risky, it would be silently
+wrong in a way `best_match()` could never detect on its own afterward.
+That's `PackIncompatibleError`, raised before anything is imported.
+`model_name`, in contrast, is just a label someone wrote down — two
+packs could legitimately share the same architecture (and be perfectly
+comparable) under different declared names, or someone might have
+fine-tuned/relabeled a variant. Getting the name "wrong" isn't
+mathematically fatal, so it's recorded on `ImportSummary.warnings` and the
+import proceeds anyway — worth a second look, not worth blocking on.
+
 ---
 
 ## 🗺️ Roadmap
@@ -850,7 +929,7 @@ below `min_examples`, never on an individual capture.
 - [x] Add ambient audio + SFX (fail-soft)
 - [x] Phase 3: open-set polish (sustained "teach me?" prompt + live↔enroll handoff)
 - [x] Phase 3: match debugging (which stored example matched + confusable-enrollment warnings)
-- [ ] Phase 3: export/import a shareable "recognizer pack" file
+- [x] Phase 3: export/import a shareable "recognizer pack" file
 - [ ] Phase 3: CPU latency benchmark script
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
@@ -868,17 +947,17 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (451/451 passing).
+camera-app logic, and CLI — are built and unit tested (512/512 passing).
 **Phase 2 is complete.** Typography, themes, glass-panel HUD, vignette,
 the similarity meter, and fail-soft SFX/ambient audio are all built, tested,
 and wired into `enroll.py`/`live.py`'s real `render_preview()`/`process_frame()`
 — not standalone, unused functions in `ui.py`/`audio.py` anymore.
 **Phase 3 is in progress**, one pick-a-few enrichment at a time: open-set
 polish (sustained "New object? Press N" prompt, live→enroll→live handoff
-reusing the loaded backbone) and match debugging (which stored capture
-matched + duplicate/confusable enrollment warnings) are done; the
-recognizer-pack export/import and a CPU latency benchmark script are still
-on the list.
+reusing the loaded backbone), match debugging (which stored capture
+matched + duplicate/confusable enrollment warnings), and recognizer-pack
+export/import are done; a CPU latency benchmark script is the last item on
+the list.
 
 What hasn't happened yet, and can't happen from this sandbox:
 
@@ -904,13 +983,17 @@ What hasn't happened yet, and can't happen from this sandbox:
 - No check of whether the two quality-warning thresholds (0.97 duplicate,
   0.75 confusion) actually fire at sensible moments on real photos — see
   design decision #18 and the note above
+- No pack has actually been shared between two different machines/people
+  yet — export/import round-trips perfectly within this sandbox (same
+  Python, same numpy), which is the part that's testable here; whether a
+  pack travels cleanly through, say, a chat app's file transfer or a USB
+  drive with a different locale's JSON encoding hasn't been tried
 
 Phases 1 and 2 from the original brief are fully built and tested. Phase 3
-is a pick-a-few menu being worked through one item at a time — two
-enrichment ideas remain (recognizer-pack export/import, CPU latency
-benchmark) alongside the hardware-dependent verification above, which is
-entirely on your machine and isn't something further sandbox work can
-substitute for.
+is a pick-a-few menu being worked through one item at a time — one
+enrichment idea remains (a CPU latency benchmark script) alongside the
+hardware-dependent verification above, which is entirely on your machine
+and isn't something further sandbox work can substitute for.
 
 ---
 

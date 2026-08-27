@@ -119,6 +119,39 @@ class TestStoreBuilding:
         assert store.is_empty()
 
 
+class TestExamplesForClass:
+    def test_empty_for_unknown_class(self):
+        store = PrototypeStore()
+        assert store.examples_for_class("ghost") == []
+
+    def test_returns_all_examples_in_capture_order(self):
+        store = PrototypeStore()
+        v1, v2, v3 = unit_vector(1), unit_vector(2), unit_vector(3)
+        store.add_example("mug", v1)
+        store.add_example("mug", v2)
+        store.add_example("mug", v3)
+        examples = store.examples_for_class("mug")
+        assert len(examples) == 3
+        np.testing.assert_array_equal(examples[0], v1)
+        np.testing.assert_array_equal(examples[1], v2)
+        np.testing.assert_array_equal(examples[2], v3)
+
+    def test_only_returns_examples_of_the_requested_class(self):
+        store = PrototypeStore()
+        store.add_example("mug", unit_vector(1))
+        store.add_example("bottle", unit_vector(2))
+        store.add_example("bottle", unit_vector(3))
+        assert len(store.examples_for_class("mug")) == 1
+        assert len(store.examples_for_class("bottle")) == 2
+
+    def test_returned_list_is_a_copy_not_the_internal_list(self):
+        store = PrototypeStore()
+        store.add_example("mug", unit_vector(1))
+        examples = store.examples_for_class("mug")
+        examples.append(unit_vector(99))  # mutate the returned list
+        assert store.example_count("mug") == 1  # store's internal state unaffected
+
+
 # --------------------------------------------------------------------------
 # PrototypeStore — prototype (centroid) computation
 # --------------------------------------------------------------------------

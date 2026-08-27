@@ -233,6 +233,66 @@ class TestArgumentParsing:
         with pytest.raises(SystemExit):
             parser.parse_args(["bogus-command"])
 
+    def test_export_requires_output_positional(self):
+        parser = main.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["export"])
+
+    def test_export_defaults(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["export", "pack.json"])
+        assert args.output == "pack.json"
+        assert args.labels is None
+        assert args.store == main.DEFAULT_STORE_PATH
+
+    def test_export_repeated_label_flag_accumulates(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["export", "pack.json", "--label", "mug", "--label", "bottle"])
+        assert args.labels == ["mug", "bottle"]
+
+    def test_export_store_flag_after_subcommand(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["export", "pack.json", "--store", "custom.json"])
+        assert args.store == "custom.json"
+
+    def test_import_requires_pack_path_positional(self):
+        parser = main.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["import"])
+
+    def test_import_defaults(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["import", "pack.json"])
+        assert args.pack_path == "pack.json"
+        assert args.on_conflict == "skip"
+        assert args.info is False
+
+    def test_import_on_conflict_choices_enforced(self):
+        parser = main.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["import", "pack.json", "--on-conflict", "bogus"])
+
+    def test_import_on_conflict_can_be_set(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["import", "pack.json", "--on-conflict", "merge"])
+        assert args.on_conflict == "merge"
+
+    def test_import_info_flag(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["import", "pack.json", "--info"])
+        assert args.info is True
+
+    def test_export_and_import_do_not_expose_backbone_flags(self):
+        """export/import never touch the backbone — confirms they got the
+        minimal store_only parent, not the full `common` set."""
+        parser = main.build_parser()
+        export_args = parser.parse_args(["export", "pack.json"])
+        assert not hasattr(export_args, "device")
+        assert not hasattr(export_args, "mute")
+        import_args = parser.parse_args(["import", "pack.json"])
+        assert not hasattr(import_args, "device")
+        assert not hasattr(import_args, "mute")
+
 
 # --------------------------------------------------------------------------
 # cmd_list — no mocking needed, no camera/backbone involved at all
@@ -272,6 +332,163 @@ class TestCmdList:
         main.cmd_list(args)
         out = capsys.readouterr().out
         assert out.index("apple") < out.index("zebra")
+
+
+# --------------------------------------------------------------------------
+# cmd_export — no mocking needed, no camera/backbone involved at all
+# --------------------------------------------------------------------------
+
+class TestCmdExport:
+    def _store_with_mug(self, tmp_path):
+        store = PrototypeStore()
+        store.add_example("mug", np.zeros(4, dtype=np.float32))
+        store.add_example("bottle", np.ones(4, dtype=np.float32))
+        store_path = tmp_path / "p.json"
+        store.save(store_path)
+        return store_path
+
+    def test_empty_store_errors(self, tmp_path, capsys):
+        args = argparse.Namespace(
+            store=str(tmp_path / "missing.json"), output=str(tmp_path / "pack.json"), labels=None,
+        )
+        rc = main.cmd_export(args)
+        assert rc == 1
+        assert "Nothing to export" in capsys.readouterr().err
+
+    def test_exports_all_classes_by_default(self, tmp_path, capsys):
+        store_path = self._store_with_mug(tmp_path)
+        pack_path = tmp_path / "pack.json"
+        args = argparse.Namespace(store=str(store_path), output=str(pack_path), labels=None)
+
+        rc = main.cmd_export(args)
+
+        assert rc == 0
+        assert pack_path.exists()
+        out = capsys.readouterr().out
+        assert "mug" in out and "bottle" in out
+
+    def test_exports_only_specified_labels(self, tmp_path):
+        store_path = self._store_with_mug(tmp_path)
+        pack_path = tmp_path / "pack.json"
+        args = argparse.Namespace(store=str(store_path), output=str(pack_path), labels=["mug"])
+
+        main.cmd_export(args)
+
+        from protovision.pack import load_pack_metadata
+        meta = load_pack_metadata(pack_path)
+        assert meta["labels"] == ["mug"]
+
+    def test_unknown_label_errors(self, tmp_path, capsys):
+        store_path = self._store_with_mug(tmp_path)
+        args = argparse.Namespace(
+            store=str(store_path), output=str(tmp_path / "pack.json"), labels=["ghost"],
+        )
+        rc = main.cmd_export(args)
+        assert rc == 1
+        assert "error" in capsys.readouterr().err.lower()
+
+
+# --------------------------------------------------------------------------
+# cmd_import — no mocking needed, no camera/backbone involved at all
+# --------------------------------------------------------------------------
+
+class TestCmdImport:
+    def _make_pack(self, tmp_path, labels=("mug",)):
+        from protovision.pack import export_pack
+        store = PrototypeStore()
+        for label in labels:
+            store.add_example(label, np.random.default_rng(hash(label) % 1000).normal(size=8).astype(np.float32))
+        pack_path = tmp_path / "pack.json"
+        export_pack(store, pack_path)
+        return pack_path
+
+    def test_info_previews_without_importing(self, tmp_path, capsys):
+        pack_path = self._make_pack(tmp_path)
+        store_path = tmp_path / "store.json"
+        args = argparse.Namespace(store=str(store_path), pack_path=str(pack_path), info=True, on_conflict="skip")
+
+        rc = main.cmd_import(args)
+
+        assert rc == 0
+        assert "mug" in capsys.readouterr().out
+        assert not store_path.exists()  # nothing was actually imported/saved
+
+    def test_info_on_invalid_pack_errors(self, tmp_path, capsys):
+        bad_pack = tmp_path / "bad.json"
+        bad_pack.write_text("not valid json")
+        args = argparse.Namespace(store=str(tmp_path / "store.json"), pack_path=str(bad_pack), info=True, on_conflict="skip")
+
+        rc = main.cmd_import(args)
+
+        assert rc == 1
+        assert "error" in capsys.readouterr().err.lower()
+
+    def test_import_into_empty_store_adds_and_saves(self, tmp_path, capsys):
+        pack_path = self._make_pack(tmp_path)
+        store_path = tmp_path / "store.json"
+        args = argparse.Namespace(store=str(store_path), pack_path=str(pack_path), info=False, on_conflict="skip")
+
+        rc = main.cmd_import(args)
+
+        assert rc == 0
+        assert store_path.exists()
+        assert "Added" in capsys.readouterr().out
+        assert PrototypeStore.load(store_path).example_count("mug") == 1
+
+    def test_conflicting_class_skipped_by_default(self, tmp_path, capsys):
+        pack_path = self._make_pack(tmp_path, labels=("mug",))
+        store_path = tmp_path / "store.json"
+        existing = PrototypeStore()
+        existing.add_example("mug", np.zeros(8, dtype=np.float32))
+        existing.save(store_path)
+
+        args = argparse.Namespace(store=str(store_path), pack_path=str(pack_path), info=False, on_conflict="skip")
+        rc = main.cmd_import(args)
+
+        assert rc == 0
+        assert "Skipped" in capsys.readouterr().out
+        assert PrototypeStore.load(store_path).example_count("mug") == 1  # untouched
+
+    def test_conflicting_class_merged_when_requested(self, tmp_path, capsys):
+        pack_path = self._make_pack(tmp_path, labels=("mug",))
+        store_path = tmp_path / "store.json"
+        existing = PrototypeStore()
+        existing.add_example("mug", np.zeros(8, dtype=np.float32))
+        existing.save(store_path)
+
+        args = argparse.Namespace(store=str(store_path), pack_path=str(pack_path), info=False, on_conflict="merge")
+        rc = main.cmd_import(args)
+
+        assert rc == 0
+        assert "Merged" in capsys.readouterr().out
+        assert PrototypeStore.load(store_path).example_count("mug") == 2
+
+    def test_incompatible_dimension_errors_cleanly(self, tmp_path, capsys):
+        pack_path = self._make_pack(tmp_path)  # dim=8
+        store_path = tmp_path / "store.json"
+        existing = PrototypeStore()
+        existing.add_example("keys", np.zeros(384, dtype=np.float32))  # different dim
+        existing.save(store_path)
+
+        args = argparse.Namespace(store=str(store_path), pack_path=str(pack_path), info=False, on_conflict="skip")
+        rc = main.cmd_import(args)
+
+        assert rc == 1
+        assert "error" in capsys.readouterr().err.lower()
+
+    def test_nothing_changed_when_only_skips(self, tmp_path, capsys):
+        pack_path = self._make_pack(tmp_path, labels=("mug",))
+        store_path = tmp_path / "store.json"
+        existing = PrototypeStore()
+        existing.add_example("mug", np.zeros(8, dtype=np.float32))
+        existing.save(store_path)
+        original_mtime = store_path.stat().st_mtime_ns
+
+        args = argparse.Namespace(store=str(store_path), pack_path=str(pack_path), info=False, on_conflict="skip")
+        main.cmd_import(args)
+
+        # store file shouldn't have been rewritten if nothing actually changed
+        assert store_path.stat().st_mtime_ns == original_mtime
 
 
 # --------------------------------------------------------------------------

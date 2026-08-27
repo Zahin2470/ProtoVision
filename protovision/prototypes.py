@@ -85,6 +85,21 @@ class PrototypeStore:
     def is_empty(self) -> bool:
         return len(self._classes) == 0
 
+    def examples_for_class(self, label: str) -> List[np.ndarray]:
+        """
+        Every stored example embedding for `label`, in capture order — the
+        raw data behind `class_prototype()`'s single averaged vector. Used
+        by pack.py's export (and anything else that needs individual
+        examples rather than just the centroid — the Phase 3 match-
+        debugging view's `best_example_for_class()` is another example).
+
+        Returns a shallow copy of the internal list; the embeddings
+        themselves aren't copied (treat them as read-only), but callers
+        can't accidentally corrupt the store's internal bookkeeping by
+        mutating the returned list itself.
+        """
+        return list(self._classes.get(label, []))
+
     def class_prototype(self, label: str) -> np.ndarray:
         """Mean (centroid) embedding for a class, re-normalized to unit length."""
         examples = self._classes.get(label)

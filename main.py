@@ -9,6 +9,10 @@ Usage:
     python main.py live --threshold 0.6 --match-mode max --frame-skip 3
     python main.py live --mute
     python main.py list
+    python main.py export my_pack.json
+    python main.py export my_pack.json --label mug --label bottle
+    python main.py import my_pack.json --on-conflict merge
+    python main.py import my_pack.json --info
 
 'live' also supports on-the-fly teaching: once an object has stayed
 unrecognized long enough, the HUD offers "New object? Press N" — pressing N
@@ -33,6 +37,7 @@ from protovision.backbone import DinoV3NotAvailableError, load_default_backbone
 from protovision.enroll import EnrollApp, EnrollState
 from protovision.live import LiveApp, LiveExitReason
 from protovision.prototypes import PrototypeStore
+from protovision.pack import export_pack, import_pack, load_pack_metadata, PackFormatError, PackIncompatibleError
 from protovision.ui import ThemeManager
 from protovision.audio import AudioManager
 
@@ -120,6 +125,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="List enrolled classes and example counts. Reads the store only — no camera or backbone needed.",
     )
 
+    # export/import only ever touch the store file — no camera, backbone,
+    # or audio involved, so they get a minimal parent (just --store)
+    # instead of `common`'s full set of camera/backbone/audio flags.
+    store_only = argparse.ArgumentParser(add_help=False)
+    store_only.add_argument(
+        "--store", default=DEFAULT_STORE_PATH,
+        help=f"Path to the prototypes JSON file (default: {DEFAULT_STORE_PATH}).",
+    )
+
+    export_p = subparsers.add_parser(
+        "export", parents=[store_only],
+        help="Export enrolled classes as a shareable recognizer pack file.",
+    )
+    export_p.add_argument("output", help="Path to write the recognizer pack (e.g. my_objects_pack.json).")
+    export_p.add_argument(
+        "--label", action="append", dest="labels", default=None,
+        help="Class to include (repeatable, e.g. --label mug --label bottle). Default: every enrolled class.",
+    )
+
+    import_p = subparsers.add_parser(
+        "import", parents=[store_only],
+        help="Import a recognizer pack's classes into the current store.",
+    )
+    import_p.add_argument("pack_path", help="Path to the recognizer pack file to import.")
+    import_p.add_argument(
+        "--on-conflict", choices=["skip", "merge", "overwrite"], default="skip",
+        help="What to do when a class in the pack already exists locally (default: skip).",
+    )
+    import_p.add_argument(
+        "--info", action="store_true",
+        help="Preview the pack's contents (classes, model, embed_dim) without importing anything.",
+    )
+
     return parser
 
 
@@ -150,6 +188,70 @@ def cmd_list(args: argparse.Namespace) -> int:
     print(f"Enrolled classes in '{args.store}':")
     for label in sorted(store.labels()):
         print(f"  {label}: {store.example_count(label)} example(s)")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """No camera, no backbone — reads the store and writes a pack file.
+    Fully unit-testable, same as cmd_list."""
+    store = PrototypeStore.load_or_empty(args.store)
+    if store.is_empty():
+        print(f"Nothing to export — '{args.store}' has no enrolled classes.", file=sys.stderr)
+        return 1
+    try:
+        exported = export_pack(store, args.output, labels=args.labels)
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"Exported {len(exported)} class(es) to '{args.output}': {', '.join(sorted(exported))}")
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """No camera, no backbone — reads a pack file and updates the store.
+    Fully unit-testable, same as cmd_list/cmd_export."""
+    if args.info:
+        try:
+            meta = load_pack_metadata(args.pack_path)
+        except PackFormatError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"Recognizer pack: '{args.pack_path}'")
+        print(f"  format version : {meta['pack_format_version']}")
+        print(f"  created        : {meta['created_at']}")
+        print(f"  model          : {meta['model_name']}")
+        print(f"  embed_dim      : {meta['embed_dim']}")
+        print(f"  classes ({len(meta['labels'])}): {', '.join(sorted(meta['labels']))}")
+        if meta["metadata"]:
+            print(f"  metadata       : {meta['metadata']}")
+        return 0
+
+    store = PrototypeStore.load_or_empty(args.store)
+    try:
+        summary = import_pack(store, args.pack_path, on_conflict=args.on_conflict)
+    except (PackFormatError, PackIncompatibleError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    for warning in summary.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+    if summary.changed_any_class:
+        store.save(args.store)
+
+    if summary.added:
+        print(f"Added: {', '.join(sorted(summary.added))}")
+    if summary.merged:
+        print(f"Merged (examples appended): {', '.join(sorted(summary.merged))}")
+    if summary.overwritten:
+        print(f"Overwritten: {', '.join(sorted(summary.overwritten))}")
+    if summary.skipped:
+        print(
+            "Skipped (already exists — use --on-conflict merge/overwrite to change this): "
+            f"{', '.join(sorted(summary.skipped))}"
+        )
+    if not summary.changed_any_class:
+        print("Nothing changed.")
     return 0
 
 
@@ -251,6 +353,8 @@ COMMANDS = {
     "enroll": cmd_enroll,
     "live": cmd_live,
     "list": cmd_list,
+    "export": cmd_export,
+    "import": cmd_import,
 }
 
 
