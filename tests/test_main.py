@@ -293,6 +293,37 @@ class TestArgumentParsing:
         assert not hasattr(import_args, "device")
         assert not hasattr(import_args, "mute")
 
+    def test_benchmark_defaults(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["benchmark"])
+        assert args.runs == 50
+        assert args.warmup == 5
+        assert args.image_size == 224
+        assert args.device == "cpu"
+
+    def test_benchmark_overrides(self):
+        parser = main.build_parser()
+        args = parser.parse_args(
+            ["benchmark", "--runs", "100", "--warmup", "10", "--image-size", "128", "--device", "cuda"]
+        )
+        assert args.runs == 100
+        assert args.warmup == 10
+        assert args.image_size == 128
+        assert args.device == "cuda"
+
+    def test_benchmark_rejects_invalid_device(self):
+        parser = main.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["benchmark", "--device", "bogus"])
+
+    def test_benchmark_does_not_expose_store_or_audio_flags(self):
+        """benchmark never touches the store, camera, or audio — confirms
+        it got its own minimal parent, not `common`."""
+        parser = main.build_parser()
+        args = parser.parse_args(["benchmark"])
+        assert not hasattr(args, "store")
+        assert not hasattr(args, "mute")
+
 
 # --------------------------------------------------------------------------
 # cmd_list — no mocking needed, no camera/backbone involved at all
@@ -851,6 +882,85 @@ class TestCmdLiveTeachMeLoop:
 
         assert rc == 0
         assert len(fake_live_cls.created) == 2
+
+
+# --------------------------------------------------------------------------
+# cmd_benchmark
+# --------------------------------------------------------------------------
+
+class TestCmdBenchmark:
+    def _args(self, **overrides):
+        defaults = dict(repo=None, weights=None, device="cpu", runs=5, warmup=1, image_size=32)
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_exits_when_backbone_unavailable(self, monkeypatch):
+        def raiser(**kwargs):
+            raise DinoV3NotAvailableError("no repo")
+
+        monkeypatch.setattr(main, "load_default_backbone", raiser)
+        with pytest.raises(SystemExit):
+            main.cmd_benchmark(self._args())
+
+    def test_success_prints_report_and_returns_zero(self, monkeypatch, capsys):
+        class FakeBackbone:
+            def embed(self, image, input_is_bgr=True):
+                return np.zeros(8, dtype=np.float32)
+
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: FakeBackbone())
+
+        rc = main.cmd_benchmark(self._args())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "mean" in out
+        assert "--frame-skip" in out
+
+    def test_passes_run_parameters_through(self, monkeypatch):
+        class FakeBackbone:
+            def embed(self, image, input_is_bgr=True):
+                return np.zeros(8, dtype=np.float32)
+
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: FakeBackbone())
+
+        captured_kwargs = {}
+        real_run_benchmark = main.run_benchmark
+
+        def spy_run_benchmark(backbone, **kwargs):
+            captured_kwargs.update(kwargs)
+            return real_run_benchmark(backbone, **kwargs)
+
+        monkeypatch.setattr(main, "run_benchmark", spy_run_benchmark)
+
+        main.cmd_benchmark(self._args(runs=7, warmup=2, image_size=64))
+
+        assert captured_kwargs["num_runs"] == 7
+        assert captured_kwargs["warmup_runs"] == 2
+        assert captured_kwargs["image_size"] == 64
+
+    def test_invalid_run_parameters_reported_cleanly(self, monkeypatch, capsys):
+        class FakeBackbone:
+            def embed(self, image, input_is_bgr=True):
+                return np.zeros(8, dtype=np.float32)
+
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: FakeBackbone())
+
+        rc = main.cmd_benchmark(self._args(runs=0))
+
+        assert rc == 1
+        assert "error" in capsys.readouterr().err.lower()
+
+    def test_does_not_touch_store_or_audio(self, monkeypatch):
+        """benchmark has no --store/--mute in its args at all — confirms
+        cmd_benchmark never reaches for args.store or args.mute."""
+        class FakeBackbone:
+            def embed(self, image, input_is_bgr=True):
+                return np.zeros(8, dtype=np.float32)
+
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: FakeBackbone())
+        args = self._args()  # no store/mute attributes present at all
+        rc = main.cmd_benchmark(args)  # should not raise AttributeError
+        assert rc == 0
 
 
 # --------------------------------------------------------------------------

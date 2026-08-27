@@ -13,6 +13,8 @@ Usage:
     python main.py export my_pack.json --label mug --label bottle
     python main.py import my_pack.json --on-conflict merge
     python main.py import my_pack.json --info
+    python main.py benchmark
+    python main.py benchmark --runs 100 --image-size 224
 
 'live' also supports on-the-fly teaching: once an object has stayed
 unrecognized long enough, the HUD offers "New object? Press N" — pressing N
@@ -38,6 +40,7 @@ from protovision.enroll import EnrollApp, EnrollState
 from protovision.live import LiveApp, LiveExitReason
 from protovision.prototypes import PrototypeStore
 from protovision.pack import export_pack, import_pack, load_pack_metadata, PackFormatError, PackIncompatibleError
+from protovision.benchmark import run_benchmark, format_benchmark_report
 from protovision.ui import ThemeManager
 from protovision.audio import AudioManager
 
@@ -156,6 +159,38 @@ def build_parser() -> argparse.ArgumentParser:
     import_p.add_argument(
         "--info", action="store_true",
         help="Preview the pack's contents (classes, model, embed_dim) without importing anything.",
+    )
+
+    # benchmark needs the real backbone (repo/weights/device) but never
+    # touches the store, camera, or audio — its own minimal parent.
+    backbone_only = argparse.ArgumentParser(add_help=False)
+    backbone_only.add_argument(
+        "--repo", default=None,
+        help="Path to a local DINOv3 repo clone (default: $PROTOVISION_DINOV3_REPO or ./dinov3_repo).",
+    )
+    backbone_only.add_argument(
+        "--weights", default=None,
+        help="Path or URL to DINOv3 weights (default: $PROTOVISION_DINOV3_WEIGHTS or ./data/weights/...).",
+    )
+    backbone_only.add_argument(
+        "--device", default="cpu", choices=["cpu", "cuda", "mps"],
+        help="Torch device to run the backbone on (default: cpu). See docs/DINOV3_SETUP.md before trying mps.",
+    )
+
+    benchmark_p = subparsers.add_parser(
+        "benchmark", parents=[backbone_only],
+        help="Measure DINOv3 embedding latency on this machine and suggest a --frame-skip value.",
+    )
+    benchmark_p.add_argument(
+        "--runs", type=int, default=50, help="Number of timed inference calls (default: 50).",
+    )
+    benchmark_p.add_argument(
+        "--warmup", type=int, default=5,
+        help="Untimed warmup calls before measuring, lets one-time startup costs settle first (default: 5).",
+    )
+    benchmark_p.add_argument(
+        "--image-size", type=int, default=224,
+        help="Synthetic test image size in pixels, must be a multiple of 16 (default: 224).",
     )
 
     return parser
@@ -349,12 +384,40 @@ def cmd_live(args: argparse.Namespace) -> int:
         # loop back around into live recognition
 
 
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    """
+    Loads the real DINOv3 backbone (needs real weights — see
+    docs/DINOV3_SETUP.md) and times repeated embed() calls on a synthetic
+    image, then prints a report with concrete --frame-skip suggestions.
+    Never touches the store, camera, or audio.
+    """
+    backbone = _load_backbone_or_exit(args)
+    print(
+        f"Running {args.runs} timed inference(s) on a {args.image_size}x{args.image_size} "
+        f"synthetic image ({args.warmup} warmup run(s) first, not counted)..."
+    )
+    try:
+        result = run_benchmark(
+            backbone,
+            num_runs=args.runs,
+            warmup_runs=args.warmup,
+            image_size=args.image_size,
+            device_label=args.device,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(format_benchmark_report(result))
+    return 0
+
+
 COMMANDS = {
     "enroll": cmd_enroll,
     "live": cmd_live,
     "list": cmd_list,
     "export": cmd_export,
     "import": cmd_import,
+    "benchmark": cmd_benchmark,
 }
 
 

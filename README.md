@@ -92,14 +92,14 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **512/512 passing** |
+| 🧪 Strong test coverage | Current test suite reports **556/556 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — in progress (pick-a-few enrichments, one at a time).**
+> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — all 4 pick-a-few enrichments complete and tested.**
 
 | Phase | Step | Component | Status |
 |:---:|:---:|---|:---:|
@@ -115,7 +115,7 @@ Example Images
 | 3 | **1** | Open-set polish — sustained "New object? Press N" prompt + live→enroll→live handoff | ✅ Complete & tested |
 | 3 | **2** | Match debugging (which stored example matched + noisy/confusable-enrollment warnings) | ✅ Complete & tested |
 | 3 | **3** | Export/import a shareable "recognizer pack" file | ✅ Complete & tested |
-| 3 | **4** | CPU latency benchmark script | ⏳ Not started |
+| 3 | **4** | CPU latency benchmark script | ✅ Complete & tested |
 
 ---
 
@@ -140,7 +140,7 @@ flowchart LR
 
 ```text
 ProtoVision/
-├── main.py             # CLI entry point (enroll / live / list / export / import)
+├── main.py             # CLI entry point (enroll / live / list / export / import / benchmark)
 ├── protovision/
 │   ├── backbone.py     # DINOv3 loading + embedding extraction
 │   ├── prototypes.py   # Prototype storage + similarity matching
@@ -149,13 +149,14 @@ ProtoVision/
 │   ├── live.py         # Live recognition (frame-skip inference + best_match)
 │   ├── ui.py            # Visual design system: typography, themes, glass panels, vignette, similarity meter
 │   ├── audio.py          # Fail-soft SFX + ambient audio (pygame)
-│   └── pack.py            # Export/import a shareable "recognizer pack"
+│   ├── pack.py            # Export/import a shareable "recognizer pack"
+│   └── benchmark.py        # CPU inference-latency benchmark + frame_skip suggestions
 ├── assets/
 │   ├── fonts/            # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
 │   └── audio/
 │       ├── sfx/           # enroll_success.wav, match_found.wav
 │       └── music/         # ambient_pad.wav
-├── tests/              # Automated tests (512, all passing)
+├── tests/              # Automated tests (556, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -206,10 +207,17 @@ python main.py import my_pack.json --info
 # pack's examples to it instead, --on-conflict overwrite replaces it
 python main.py import my_pack.json
 python main.py import my_pack.json --on-conflict merge
+
+# Measure DINOv3 embedding latency on this machine and get a concrete
+# --frame-skip suggestion for `live` — needs the real backbone, same as
+# enroll/live
+python main.py benchmark
+python main.py benchmark --runs 100 --image-size 224
 ```
 
-`enroll`/`live` both need the real DINOv3 repo + weights in place first (see
-`docs/DINOV3_SETUP.md`) — `list` doesn't, it just reads `data/prototypes.json`.
+`enroll`/`live`/`benchmark` all need the real DINOv3 repo + weights in
+place first (see `docs/DINOV3_SETUP.md`) — `list`/`export`/`import` don't,
+they just read/write `data/prototypes.json` or a pack file.
 Every flag has a `--help`: `python main.py enroll --help`.
 
 ## 🧪 What Is Actually Tested?
@@ -529,6 +537,39 @@ actual `render_preview()`
   modification time), and that `export`/`import` don't expose irrelevant
   flags like `--device`/`--mute` that only `enroll`/`live` need
 
+**Phase 3, step 4: CPU latency benchmark**
+
+- Timing itself is tested with a scripted FAKE clock, not real
+  `time.sleep()` — `run_benchmark()` takes an injectable `clock` callable
+  (defaulting to real `time.perf_counter`), so tests can assert exact,
+  deterministic latency values instead of asserting loose ranges against
+  real system timing, which would otherwise make these tests slow and
+  occasionally flaky under CI/sandbox scheduling jitter
+- Confirmed warmup runs actually call `backbone.embed()` (so any one-time
+  startup cost genuinely gets triggered) while never consuming the timing
+  clock or appearing in the recorded latencies — a test with a fake clock
+  scripted for only the timed calls would raise `StopIteration` if warmup
+  runs were accidentally being timed too, which is exactly the failure
+  mode this test is designed to catch
+- Every derived statistic (`mean`/`median`/`stdev`/`min`/`max`/percentiles)
+  checked against hand-computable inputs, including that a single-run
+  result reports `stdev_ms == 0.0` rather than raising
+  `statistics.StatisticsError`
+- `suggested_frame_skip()` checked for the actual property that makes it
+  useful: a slower mean latency requires an equal-or-larger frame_skip to
+  keep up with the same camera frame rate, a faster camera (more frames
+  per second, less time between them) requires an equal-or-larger
+  frame_skip than a slower one for the *same* latency, the result is never
+  below 1 (matching `LiveApp`'s own `frame_skip >= 1` requirement), and an
+  exact boundary case (mean latency precisely equal to one frame interval)
+  resolves to exactly 1, not 2
+- `main.py`'s `benchmark` command is tested with a fake backbone (no real
+  DINOv3 weights needed to test the CLI wiring itself), including that run
+  parameters (`--runs`/`--warmup`/`--image-size`) actually reach
+  `run_benchmark()` unchanged, and that it correctly exits with a clear
+  error (not a raw traceback) both when the backbone is unavailable and
+  when the run parameters themselves are invalid
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -572,6 +613,12 @@ The following require the real DINOv3 weights and/or actual hardware:
   real photo — worth watching for false positives/negatives once real
   weights are in place, and adjusting the two constants at the top of
   `enroll.py` accordingly.
+- **What the actual benchmark numbers are on your Mac.** `benchmark.py`'s
+  math (statistics, `suggested_frame_skip()`) is fully tested against a
+  fake, instant backbone — that proves the arithmetic is correct, not what
+  real DINOv3 ViT-S/16 inference actually costs on CPU on your specific
+  hardware. `python main.py benchmark` needs the real weights in place
+  (`docs/DINOV3_SETUP.md`) to produce a number that means anything.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -613,8 +660,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-512 tests
-512 passed
+556 tests
+556 passed
 0 failed
 ```
 
@@ -908,6 +955,24 @@ fine-tuned/relabeled a variant. Getting the name "wrong" isn't
 mathematically fatal, so it's recorded on `ImportSummary.warnings` and the
 import proceeds anyway — worth a second look, not worth blocking on.
 
+### 22. An injectable clock instead of real sleeping, for testable timing
+
+`run_benchmark()` could have measured real elapsed time exclusively via a
+direct `time.perf_counter()` call, and tested itself with `time.sleep()`
+standing in for "slow inference". That would work, but it means every test
+either sleeps for real (slow test suite, and asserting against a range
+rather than an exact number since real sleep isn't perfectly precise) or
+gets skipped/marked slow. Instead, `run_benchmark()` takes a `clock`
+parameter defaulting to the real `time.perf_counter`, and tests inject a
+small scripted fake that returns exact, predetermined values. The result:
+the *exact same code path* real usage takes is under test — same loop,
+same arithmetic, same warmup/timed split — but the tests run in
+milliseconds and assert exact numbers instead of loose bounds. One
+real-clock sanity test (`test_default_clock_is_real_time_and_produces_positive_latencies`)
+still exists specifically to confirm the real default actually works end
+to end, so the fake-clock tests aren't the *only* thing standing between
+this and a real regression.
+
 ---
 
 ## 🗺️ Roadmap
@@ -930,7 +995,7 @@ import proceeds anyway — worth a second look, not worth blocking on.
 - [x] Phase 3: open-set polish (sustained "teach me?" prompt + live↔enroll handoff)
 - [x] Phase 3: match debugging (which stored example matched + confusable-enrollment warnings)
 - [x] Phase 3: export/import a shareable "recognizer pack" file
-- [ ] Phase 3: CPU latency benchmark script
+- [x] Phase 3: CPU latency benchmark script
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -946,20 +1011,18 @@ The current project includes:
 
 ## ⚠️ Current Limitations
 
-**Phase 1 is complete.** All four steps — backbone, prototype storage,
-camera-app logic, and CLI — are built and unit tested (512/512 passing).
-**Phase 2 is complete.** Typography, themes, glass-panel HUD, vignette,
-the similarity meter, and fail-soft SFX/ambient audio are all built, tested,
-and wired into `enroll.py`/`live.py`'s real `render_preview()`/`process_frame()`
-— not standalone, unused functions in `ui.py`/`audio.py` anymore.
-**Phase 3 is in progress**, one pick-a-few enrichment at a time: open-set
-polish (sustained "New object? Press N" prompt, live→enroll→live handoff
-reusing the loaded backbone), match debugging (which stored capture
-matched + duplicate/confusable enrollment warnings), and recognizer-pack
-export/import are done; a CPU latency benchmark script is the last item on
-the list.
+**Phases 1, 2, and 3 are all complete.** Backbone, prototype storage,
+camera-app logic, and CLI (Phase 1); typography, themes, glass-panel HUD,
+vignette, similarity meter, and fail-soft SFX/ambient audio, all wired into
+the real apps (Phase 2); and all four pick-a-few enrichments — open-set
+polish, match debugging, recognizer-pack export/import, and a CPU latency
+benchmark script (Phase 3) — are built and unit tested (556/556 passing).
+Every feature described in the original brief now exists in code, not just
+on a roadmap.
 
-What hasn't happened yet, and can't happen from this sandbox:
+What hasn't happened yet, and can't happen from this sandbox — all of it
+hardware-dependent, all of it on your machine, not something further
+sandbox work can substitute for:
 
 - The real DINOv3 repo + weights haven't been loaded and run for real (gated,
   requires your machine — see `docs/DINOV3_SETUP.md`)
@@ -988,12 +1051,17 @@ What hasn't happened yet, and can't happen from this sandbox:
   Python, same numpy), which is the part that's testable here; whether a
   pack travels cleanly through, say, a chat app's file transfer or a USB
   drive with a different locale's JSON encoding hasn't been tried
+- No real CPU latency numbers exist yet — `benchmark.py`'s statistics and
+  `suggested_frame_skip()` math are fully tested against a fake, instant
+  backbone (see design decision #22), but that only proves the arithmetic
+  is right, not what real DINOv3 ViT-S/16 actually costs on your Mac.
+  `python main.py benchmark` is the next real step once weights are in
+  place — it'll tell you the actual `--frame-skip` to run `live` with
 
-Phases 1 and 2 from the original brief are fully built and tested. Phase 3
-is a pick-a-few menu being worked through one item at a time — one
-enrichment idea remains (a CPU latency benchmark script) alongside the
-hardware-dependent verification above, which is entirely on your machine
-and isn't something further sandbox work can substitute for.
+Everything in the original brief — Phases 1, 2, and 3 — is now built and
+tested. What's left is entirely the hardware verification above: getting
+real weights running, pointing a real webcam at `enroll`/`live`, running
+the benchmark for real, and simply looking at and listening to the result.
 
 ---
 
