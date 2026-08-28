@@ -33,6 +33,9 @@ def make_live_app(
     theme_manager=None,
     glyph_cache=None,
     audio=None,
+    multi_object=False,
+    max_objects=6,
+    region_proposer=None,
 ) -> LiveApp:
     app = LiveApp.__new__(LiveApp)
     app.backbone = backbone
@@ -41,12 +44,16 @@ def make_live_app(
     app.match_mode = match_mode
     app.frame_skip = frame_skip
     app.box_fraction = box_fraction
+    app.multi_object = multi_object
+    app.max_objects = max_objects
+    app.region_proposer = region_proposer
     app._frame_counter = 0
     app._last_result = None
     app._last_similarities = {}
     app._unknown_streak = 0
     app._teach_me_requested = False
     app._matched_example_index = None
+    app._detections = []
     app.theme_manager = theme_manager if theme_manager is not None else ThemeManager()
     app.glyph_cache = glyph_cache if glyph_cache is not None else GlyphCache(font_dir=FONT_DIR)
     # enabled=False: no real pygame/audio device dependency in these pure
@@ -81,6 +88,10 @@ class TestConstructorValidation:
         with pytest.raises(ValueError):
             LiveApp(mock_backbone, PrototypeStore(), frame_skip=0)
 
+    def test_rejects_max_objects_below_one(self, mock_backbone):
+        with pytest.raises(ValueError):
+            LiveApp(mock_backbone, PrototypeStore(), max_objects=0)
+
     def test_accepts_valid_match_modes_before_camera_call(self):
         # We can't construct all the way (no real camera in the sandbox),
         # but we CAN confirm validation doesn't reject legitimate values by
@@ -104,6 +115,31 @@ class TestConstructorWithFakeCamera:
         assert app.frame_skip == 5
         assert app.box_fraction == 0.5
         assert app.last_result is None
+        assert app.multi_object is False
+        assert app.detections == []
+
+    def test_max_objects_defaults_to_detect_default(self, monkeypatch, mock_backbone):
+        from protovision.detect import DEFAULT_MAX_REGIONS
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        app = LiveApp(mock_backbone, PrototypeStore())
+        assert app.max_objects == DEFAULT_MAX_REGIONS
+
+    def test_custom_max_objects_is_used(self, monkeypatch, mock_backbone):
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        app = LiveApp(mock_backbone, PrototypeStore(), max_objects=3)
+        assert app.max_objects == 3
+
+    def test_region_proposer_defaults_to_propose_regions(self, monkeypatch, mock_backbone):
+        from protovision.detect import propose_regions
+        monkeypatch.setattr("protovision.live.Camera", FakeCamera)
+        app = LiveApp(mock_backbone, PrototypeStore())
+        assert app.region_proposer is propose_regions
+
+    def test_injected_region_proposer_is_used(self, mock_backbone):
+        def fake_proposer(frame, max_regions=6):
+            return []
+        app = LiveApp(mock_backbone, PrototypeStore(), region_proposer=fake_proposer, camera=FakeCamera())
+        assert app.region_proposer is fake_proposer
 
     def test_opens_a_camera_when_none_injected(self, monkeypatch, mock_backbone):
         monkeypatch.setattr("protovision.live.Camera", FakeCamera)
@@ -258,6 +294,241 @@ def store_with_two_classes(dim=16):
     store.add_examples("mug", [mug_base.copy() for _ in range(5)])
     store.add_examples("bottle", [bottle_base.copy() for _ in range(5)])
     return store, mug_base, bottle_base
+
+
+class SequenceRegionProposer:
+    """Returns pre-programmed lists of GuideBox regions in order, one list
+    per call — lets multi-object tests control exactly what regions a
+    "detection" call sees, without needing a real detectable synthetic
+    image every time (that's detect.py's own test file's job)."""
+
+    def __init__(self, region_lists):
+        self._region_lists = list(region_lists)
+        self._index = 0
+
+    def __call__(self, frame, max_regions=6):
+        idx = min(self._index, len(self._region_lists) - 1)
+        self._index += 1
+        return self._region_lists[idx][:max_regions]
+
+
+# --------------------------------------------------------------------------
+# multi-object mode
+# --------------------------------------------------------------------------
+
+class TestMultiObjectMode:
+    def _two_boxes(self):
+        from protovision.capture import GuideBox
+        return [GuideBox(0, 0, 20, 20), GuideBox(50, 50, 70, 70)]
+
+    def test_single_object_mode_never_populates_detections(self, mock_backbone):
+        store = enrolled_store("mug")
+        app = make_live_app(backbone=mock_backbone, store=store, multi_object=False)
+        app.process_frame(make_test_frame())
+        assert app.detections == []
+
+    def test_multi_object_mode_calls_region_proposer(self, mock_backbone):
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes])
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        app.process_frame(make_test_frame(width=100, height=100))
+        assert len(app.detections) == 2
+
+    def test_detections_pair_each_region_with_a_match_result(self, mock_backbone):
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes])
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        app.process_frame(make_test_frame(width=100, height=100))
+        for box, result in app.detections:
+            assert box in boxes
+            assert isinstance(result, MatchResult)
+
+    def test_empty_region_list_gives_empty_detections(self, mock_backbone):
+        proposer = SequenceRegionProposer([[]])
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        app.process_frame(make_test_frame())
+        assert app.detections == []
+
+    def test_process_frame_returns_detections_list_in_multi_mode(self, mock_backbone):
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes])
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        result = app.process_frame(make_test_frame(width=100, height=100))
+        assert result is app.detections
+
+    def test_max_objects_passed_through_to_region_proposer(self, mock_backbone):
+        received = {}
+
+        def spy_proposer(frame, max_regions=6):
+            received["max_regions"] = max_regions
+            return []
+
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1,
+            region_proposer=spy_proposer, max_objects=3,
+        )
+        app.process_frame(make_test_frame())
+        assert received["max_regions"] == 3
+
+    def test_respects_frame_skip_like_single_object_mode(self, mock_backbone):
+        calls = {"count": 0}
+
+        def counting_proposer(frame, max_regions=6):
+            calls["count"] += 1
+            return []
+
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=5,
+            region_proposer=counting_proposer,
+        )
+        for _ in range(4):  # within the first frame_skip window
+            app.process_frame(make_test_frame())
+        assert calls["count"] == 1
+
+    def test_held_detections_between_skipped_frames(self, mock_backbone):
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes])
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=5, region_proposer=proposer,
+        )
+        app.process_frame(make_test_frame(width=100, height=100, seed=1))
+        first = app.detections
+        app.process_frame(make_test_frame(width=100, height=100, seed=2))  # held frame
+        assert app.detections is first
+
+    def test_does_not_update_single_object_state(self, mock_backbone):
+        """Multi-object mode shouldn't leave single-object mode's state
+        (last_result, unknown_streak, matched_example_index) looking like
+        something happened — it should stay exactly as constructed."""
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes])
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        app.process_frame(make_test_frame(width=100, height=100))
+        assert app.last_result is None
+        assert app.unknown_streak == 0
+        assert app.matched_example_index is None
+
+    def test_does_not_play_match_found_chime(self, mock_backbone):
+        """Documented scope boundary: no cross-frame identity for detected
+        regions (no tracking), so the 'transition into a known match'
+        concept the chime relies on doesn't apply here."""
+        store, mug_base, _ = store_with_two_classes()
+        boxes = self._two_boxes()
+
+        class FixedEmbeddingBackbone:
+            def embed(self, image, input_is_bgr=True):
+                return mug_base  # every region "matches" mug confidently
+
+        proposer = SequenceRegionProposer([boxes, boxes, boxes])
+        spy = SpyAudio()
+        app = make_live_app(
+            backbone=FixedEmbeddingBackbone(), store=store, multi_object=True,
+            frame_skip=1, region_proposer=proposer, audio=spy,
+        )
+        for _ in range(3):
+            app.process_frame(make_test_frame(width=100, height=100))
+        assert spy.match_found_calls == 0
+
+    def test_wants_to_teach_never_true_in_multi_object_mode(self, mock_backbone):
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes] * 10)
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        for _ in range(10):
+            app.process_frame(make_test_frame(width=100, height=100))
+        assert app.wants_to_teach is False
+
+    def test_teach_key_is_a_noop_in_multi_object_mode(self, mock_backbone):
+        boxes = self._two_boxes()
+        proposer = SequenceRegionProposer([boxes] * 10)
+        app = make_live_app(
+            backbone=mock_backbone, multi_object=True, frame_skip=1, region_proposer=proposer,
+        )
+        for _ in range(10):
+            app.process_frame(make_test_frame(width=100, height=100))
+        from protovision.live import KEY_TEACH_ME
+        consumed = app.handle_key(KEY_TEACH_ME)
+        assert consumed is False
+        assert app._teach_me_requested is False
+
+
+class TestMultiObjectPreview:
+    def _detections_fixture(self):
+        from protovision.capture import GuideBox
+        return [
+            (GuideBox(10, 10, 40, 40), MatchResult(label="mug", similarity=0.9, is_known=True)),
+            (GuideBox(60, 60, 90, 90), MatchResult(label=None, similarity=0.1, is_known=False)),
+        ]
+
+    def test_render_preview_same_shape(self):
+        app = make_live_app(multi_object=True)
+        frame = make_test_frame(width=128, height=128)
+        out = app.render_preview(frame)
+        assert out.shape == frame.shape
+
+    def test_render_preview_does_not_mutate_input(self):
+        app = make_live_app(multi_object=True)
+        app._detections = self._detections_fixture()
+        frame = make_test_frame(width=128, height=128)
+        original = frame.copy()
+        app.render_preview(frame)
+        np.testing.assert_array_equal(frame, original)
+
+    def test_render_preview_draws_something_with_no_detections(self):
+        app = make_live_app(multi_object=True)
+        frame = make_test_frame(width=200, height=200, color=(90, 90, 90))
+        out = app.render_preview(frame)
+        assert not np.array_equal(out[30, 30], frame[30, 30])  # status panel still drawn
+
+    def test_render_preview_draws_each_detection_box(self):
+        app = make_live_app(multi_object=True)
+        app._detections = self._detections_fixture()
+        frame = make_test_frame(width=128, height=128, color=(90, 90, 90))
+        out = app.render_preview(frame)
+        # a pixel on the border of the first detection's box should differ
+        # from the plain background
+        assert not np.array_equal(out[10, 25], frame[10, 25])
+
+    def test_render_preview_differs_between_zero_and_two_detections(self):
+        app_empty = make_live_app(multi_object=True)
+        app_two = make_live_app(multi_object=True)
+        app_two._detections = self._detections_fixture()
+        frame = make_test_frame(width=128, height=128, color=(90, 90, 90))
+        out_empty = app_empty.render_preview(frame)
+        out_two = app_two.render_preview(frame)
+        assert not np.array_equal(out_empty, out_two)
+
+    def test_render_preview_respects_active_theme(self):
+        frame = make_test_frame(width=200, height=200, color=(90, 90, 90))
+        app_dark = make_live_app(multi_object=True, theme_manager=ThemeManager(initial="dark"))
+        app_neon = make_live_app(multi_object=True, theme_manager=ThemeManager(initial="neon"))
+        app_dark._detections = self._detections_fixture()
+        app_neon._detections = self._detections_fixture()
+        out_dark = app_dark.render_preview(frame)
+        out_neon = app_neon.render_preview(frame)
+        assert not np.array_equal(out_dark, out_neon)
+
+    def test_render_preview_handles_detection_near_top_edge_without_crashing(self):
+        """A region right at the frame's top edge has no room to draw its
+        label above the box — render_preview should fall back to drawing
+        it just inside the box instead of crashing or clipping badly."""
+        from protovision.capture import GuideBox
+        app = make_live_app(multi_object=True)
+        app._detections = [(GuideBox(5, 0, 40, 20), MatchResult(label="mug", similarity=0.9, is_known=True))]
+        frame = make_test_frame(width=128, height=128)
+        out = app.render_preview(frame)
+        assert out.shape == frame.shape
 
 
 # --------------------------------------------------------------------------

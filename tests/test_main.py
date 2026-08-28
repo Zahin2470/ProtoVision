@@ -60,6 +60,10 @@ def make_fake_live_app_cls():
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.ran = False
+            # Mirrors real LiveApp's own default-resolution (None -> detect.py's
+            # default) closely enough for cmd_live's status-message print to
+            # work against this fake without needing the real detect module.
+            self.max_objects = kwargs.get("max_objects") or 6
             created.append(self)
 
         def run(self):
@@ -81,6 +85,7 @@ def make_fake_live_app_cls_with_reasons(reasons):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self._reason = next(reasons_iter)
+            self.max_objects = kwargs.get("max_objects") or 6
             created.append(self)
 
         def run(self):
@@ -128,6 +133,7 @@ def base_live_args(**overrides):
     defaults = dict(
         store="unused.json", repo=None, weights=None, device="cpu", mute=False,
         threshold=0.5, match_mode="mean", frame_skip=5, box_fraction=0.5,
+        multi_object=False, max_objects=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -205,6 +211,22 @@ class TestArgumentParsing:
         parser = main.build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["live", "--match-mode", "bogus"])
+
+    def test_live_multi_object_defaults_to_false(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["live"])
+        assert args.multi_object is False
+        assert args.max_objects is None
+
+    def test_live_multi_flag_sets_multi_object(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["live", "--multi"])
+        assert args.multi_object is True
+
+    def test_live_max_objects_can_be_set(self):
+        parser = main.build_parser()
+        args = parser.parse_args(["live", "--multi", "--max-objects", "3"])
+        assert args.max_objects == 3
 
     def test_rejects_invalid_device(self):
         parser = main.build_parser()
@@ -667,6 +689,33 @@ class TestCmdLive:
         assert passed["threshold"] == 0.7
         assert passed["match_mode"] == "max"
         assert passed["frame_skip"] == 2
+
+    def test_passes_multi_object_options_through_to_live_app(self, monkeypatch, tmp_path):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        fake_cls = make_fake_live_app_cls()
+        monkeypatch.setattr(main, "LiveApp", fake_cls)
+
+        main.cmd_live(base_live_args(store=str(store_path), multi_object=True, max_objects=4))
+
+        passed = fake_cls.created[0].kwargs
+        assert passed["multi_object"] is True
+        assert passed["max_objects"] == 4
+
+    def test_multi_object_prints_a_different_status_message(self, monkeypatch, tmp_path, capsys):
+        store_path = tmp_path / "p.json"
+        PrototypeStore().save(store_path)
+
+        monkeypatch.setattr(main, "load_default_backbone", lambda **kwargs: object())
+        monkeypatch.setattr(main, "LiveApp", make_fake_live_app_cls())
+
+        main.cmd_live(base_live_args(store=str(store_path), multi_object=True))
+
+        out = capsys.readouterr().out
+        assert "Multi-object" in out
+        assert "teach a new object" not in out  # single-object-only messaging shouldn't appear
 
     def test_calls_run_on_the_app(self, monkeypatch, tmp_path):
         store_path = tmp_path / "p.json"

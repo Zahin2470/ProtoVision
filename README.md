@@ -92,14 +92,14 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **556/556 passing** |
+| 🧪 Strong test coverage | Current test suite reports **615/615 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — all 4 pick-a-few enrichments complete and tested.**
+> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — all 4 pick-a-few enrichments complete and tested. Phase 4 (post-brief extensions) — in progress.**
 
 | Phase | Step | Component | Status |
 |:---:|:---:|---|:---:|
@@ -116,6 +116,8 @@ Example Images
 | 3 | **2** | Match debugging (which stored example matched + noisy/confusable-enrollment warnings) | ✅ Complete & tested |
 | 3 | **3** | Export/import a shareable "recognizer pack" file | ✅ Complete & tested |
 | 3 | **4** | CPU latency benchmark script | ✅ Complete & tested |
+| 4 | **1** | `detect.py` — classical multi-object region proposals + `live --multi` | ✅ Complete & tested |
+| 4 | **2** | Web demo (Streamlit/Gradio) | ⏳ Not started |
 
 ---
 
@@ -146,17 +148,18 @@ ProtoVision/
 │   ├── prototypes.py   # Prototype storage + similarity matching
 │   ├── capture.py      # Camera wrapper + guide-box geometry/crop
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
-│   ├── live.py         # Live recognition (frame-skip inference + best_match)
+│   ├── live.py         # Live recognition (frame-skip inference + best_match; --multi mode)
 │   ├── ui.py            # Visual design system: typography, themes, glass panels, vignette, similarity meter
 │   ├── audio.py          # Fail-soft SFX + ambient audio (pygame)
 │   ├── pack.py            # Export/import a shareable "recognizer pack"
-│   └── benchmark.py        # CPU inference-latency benchmark + frame_skip suggestions
+│   ├── benchmark.py        # CPU inference-latency benchmark + frame_skip suggestions
+│   └── detect.py            # Classical, training-free multi-object region proposals
 ├── assets/
 │   ├── fonts/            # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
 │   └── audio/
 │       ├── sfx/           # enroll_success.wav, match_found.wav
 │       └── music/         # ambient_pad.wav
-├── tests/              # Automated tests (556, all passing)
+├── tests/              # Automated tests (615, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -213,6 +216,12 @@ python main.py import my_pack.json --on-conflict merge
 # enroll/live
 python main.py benchmark
 python main.py benchmark --runs 100 --image-size 224
+
+# Recognize SEVERAL objects in frame at once — classical edge-detection
+# region proposals (no trained detector, nothing to download), one
+# themed box + label per detected object, instead of a single guide box
+python main.py live --multi
+python main.py live --multi --max-objects 4
 ```
 
 `enroll`/`live`/`benchmark` all need the real DINOv3 repo + weights in
@@ -570,6 +579,43 @@ actual `render_preview()`
   error (not a raw traceback) both when the backbone is unavailable and
   when the run parameters themselves are invalid
 
+**Phase 4: multi-object detection (`live --multi`)**
+
+- `detect.py`'s region proposals are tested against REAL OpenCV calls on
+  synthetic drawn frames (rectangles/circles on a plain or mildly noisy
+  background) — a blank frame finds nothing, three separated shapes find
+  exactly three regions with roughly the right size, a tiny speck and an
+  oversized region are correctly filtered out by the area bounds, results
+  come back sorted largest-first, `max_regions` caps the count, and a
+  mildly textured (noisy) background produces exactly the real objects
+  with no phantom extras — not just "doesn't crash"
+- The overlap-merge logic is tested in isolation from detection itself:
+  identical boxes overlap 100%, disjoint boxes 0%, a small box fully
+  inside a large one merges away (keeping the larger), and two boxes with
+  only a small corner overlap both survive when the threshold is strict
+- `live.py`'s multi-object mode is wired the same way everything
+  hardware-adjacent in this project is: `region_proposer` is an injectable
+  dependency (defaulting to the real `detect.propose_regions`), so
+  `LiveApp`'s tests script exact, fixed region lists via a small
+  `SequenceRegionProposer` test double instead of needing a real
+  detectable image every time — detection accuracy is detect.py's test
+  file's job; live.py's tests just prove the WIRING (frame-skip schedule,
+  `max_objects` passed through, held detections on skipped frames) is
+  correct
+- Explicitly tested that multi-object mode does NOT touch single-object
+  state (`last_result`, `unknown_streak`, `matched_example_index` all stay
+  at their constructed values) and does NOT play the `match_found` chime
+  or ever set `wants_to_teach` — these are documented scope boundaries
+  (see live.py's own module docstring and design decision #23 below), not
+  omissions, and are tested as such rather than just left untested
+- Caught a real layering bug before writing tests for the rendering side:
+  the first version drew the fixed-position status panel LAST, so an
+  object detected near the frame's top-left corner had its label silently
+  hidden underneath the panel. Rendered it, saw the label disappear, fixed
+  the draw order (panel first, detections on top), re-rendered to confirm,
+  then wrote `test_render_preview_handles_detection_near_top_edge_without_crashing`
+  and the rest of `TestMultiObjectPreview` against the corrected behavior
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -619,6 +665,17 @@ The following require the real DINOv3 weights and/or actual hardware:
   real DINOv3 ViT-S/16 inference actually costs on CPU on your specific
   hardware. `python main.py benchmark` needs the real weights in place
   (`docs/DINOV3_SETUP.md`) to produce a number that means anything.
+- **How well `--multi` actually detects real objects on a real desk.**
+  `detect.py`'s edge-detection pipeline is thoroughly tested against
+  synthetic drawn shapes, which proves the CONTOUR/AREA/MERGE logic is
+  correct; it says nothing about how well Canny edge detection performs
+  against real lighting, real shadows, real clutter, or real object
+  textures on an actual desk. This is the one place in the whole project
+  where "tested" and "will look good on your camera" are the most likely
+  to diverge — worth trying `live --multi` against a genuinely uncluttered
+  surface first, and tuning `detect.py`'s constants
+  (`DEFAULT_CANNY_LOW`/`HIGH`, area fractions) from there if it's too
+  noisy or too conservative.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -660,8 +717,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-556 tests
-556 passed
+615 tests
+615 passed
 0 failed
 ```
 
@@ -973,6 +1030,42 @@ still exists specifically to confirm the real default actually works end
 to end, so the fake-clock tests aren't the *only* thing standing between
 this and a real regression.
 
+### 23. Multi-object detection uses classical CV, not a trained detector
+
+This project's identity, from the original brief onward, has been "frozen
+self-supervised backbone, no training loop, no separate object detector
+for v1" — DINOv3 does the recognizing, not a detector. Recognizing several
+objects in frame at once still needs *some* way to propose candidate
+regions, but reaching for a trained detector (YOLO or similar) to do that
+would mean a new heavy dependency, a second set of gated/downloadable
+weights on top of DINOv3's own, and a real architectural shift away from
+"frozen backbone only." `detect.py` proposes regions with plain Canny edge
+detection + contours instead — no learned weights, nothing to download,
+consistent with everything else this project has done. The honest
+trade-off: it works well for a handful of objects on an uncluttered
+surface (this project's actual use case), not general cluttered-scene
+detection, and it has no notion of object *category* — it finds "something
+is here", and DINOv3 handles "what is it" exactly as before.
+
+### 24. Multi-object mode is a genuinely different mode, not "more boxes"
+
+`live --multi` deliberately drops several single-object-mode features
+rather than trying to preserve all of them at once: no `unknown_streak`,
+no "teach me?" prompt, no `match_found` chime, no per-object similarity
+meter. All four depend on comparing THIS inference to the PREVIOUS one for
+the *same physical object* — but region proposals are recomputed from
+scratch every inference with no cross-frame identity ("is this box the
+same object as that box a moment ago?"). That's object *tracking*, a
+meaningfully different problem `detect.py` doesn't attempt to solve, and
+bolting a fake version of it on top (e.g. matching boxes by position
+alone) would produce confidently wrong streaks and chimes that fire on
+coincidence rather than anything real. Dropping those features honestly
+was the right call over quietly shipping a version that lies about them
+working. The trade for the lost similarity meter is a compact label
+drawn directly on each box instead — less detail per object, but it scales
+to several objects on screen at once, which a full meter per object
+wouldn't.
+
 ---
 
 ## 🗺️ Roadmap
@@ -996,6 +1089,8 @@ this and a real regression.
 - [x] Phase 3: match debugging (which stored example matched + confusable-enrollment warnings)
 - [x] Phase 3: export/import a shareable "recognizer pack" file
 - [x] Phase 3: CPU latency benchmark script
+- [x] Phase 4: classical multi-object detection (`live --multi`)
+- [ ] Phase 4: tiny Streamlit/Gradio web demo
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -1011,14 +1106,11 @@ The current project includes:
 
 ## ⚠️ Current Limitations
 
-**Phases 1, 2, and 3 are all complete.** Backbone, prototype storage,
-camera-app logic, and CLI (Phase 1); typography, themes, glass-panel HUD,
-vignette, similarity meter, and fail-soft SFX/ambient audio, all wired into
-the real apps (Phase 2); and all four pick-a-few enrichments — open-set
-polish, match debugging, recognizer-pack export/import, and a CPU latency
-benchmark script (Phase 3) — are built and unit tested (556/556 passing).
-Every feature described in the original brief now exists in code, not just
-on a roadmap.
+**Phases 1, 2, and 3 are all complete** — every feature from the original
+brief exists in code and is unit tested (615/615 passing). **Phase 4**
+(post-brief extensions, requested afterward) **is in progress**: classical
+multi-object detection (`live --multi`) is done; a tiny Streamlit/Gradio
+web demo is next.
 
 What hasn't happened yet, and can't happen from this sandbox — all of it
 hardware-dependent, all of it on your machine, not something further
@@ -1057,11 +1149,17 @@ sandbox work can substitute for:
   is right, not what real DINOv3 ViT-S/16 actually costs on your Mac.
   `python main.py benchmark` is the next real step once weights are in
   place — it'll tell you the actual `--frame-skip` to run `live` with
+- No real check of `live --multi` against an actual desk with actual
+  objects, actual lighting, and actual shadows — see the note above and
+  design decision #23; `detect.py`'s logic is thoroughly tested, its
+  real-world detection quality on your specific setup isn't
 
-Everything in the original brief — Phases 1, 2, and 3 — is now built and
-tested. What's left is entirely the hardware verification above: getting
-real weights running, pointing a real webcam at `enroll`/`live`, running
-the benchmark for real, and simply looking at and listening to the result.
+Everything in the original brief — Phases 1, 2, and 3 — is fully built and
+tested, and Phase 4's first extension (multi-object detection) is too.
+What's left there is a web demo, plus the hardware verification above:
+getting real weights running, pointing a real webcam at `enroll`/`live`
+(single- and multi-object), running the benchmark for real, and simply
+looking at and listening to the result.
 
 ---
 

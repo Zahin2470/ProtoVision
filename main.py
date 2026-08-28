@@ -8,6 +8,8 @@ Usage:
     python main.py live
     python main.py live --threshold 0.6 --match-mode max --frame-skip 3
     python main.py live --mute
+    python main.py live --multi
+    python main.py live --multi --max-objects 4
     python main.py list
     python main.py export my_pack.json
     python main.py export my_pack.json --label mug --label bottle
@@ -120,7 +122,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live_p.add_argument(
         "--box-fraction", type=float, default=0.5,
-        help="Guide box size as a fraction of the shorter frame dimension (default: 0.5).",
+        help="Guide box size as a fraction of the shorter frame dimension (default: 0.5). "
+        "Ignored in --multi mode, which detects its own regions instead of using one guide box.",
+    )
+    live_p.add_argument(
+        "--multi", action="store_true", dest="multi_object",
+        help="Detect and recognize SEVERAL objects in frame at once (classical edge-detection "
+        "region proposals, not a trained detector — see protovision/detect.py) instead of one "
+        "user-positioned guide box. Trades the similarity meter and open-set 'teach me?' prompt "
+        "for a label drawn on each detected object; see live.py's module docstring for why.",
+    )
+    live_p.add_argument(
+        "--max-objects", type=int, default=None,
+        help="Cap on how many objects to detect/embed per inference in --multi mode "
+        "(default: detect.py's DEFAULT_MAX_REGIONS). Ignored outside --multi mode.",
     )
 
     subparsers.add_parser(
@@ -347,11 +362,19 @@ def cmd_live(args: argparse.Namespace) -> int:
             box_fraction=args.box_fraction,
             audio=audio,
             theme_manager=theme_manager,
+            multi_object=args.multi_object,
+            max_objects=args.max_objects,
         )
-        print(
-            "Live recognition running — 'q'/Esc to quit, 'T' to cycle themes, "
-            "'N' to teach a new object once prompted."
-        )
+        if args.multi_object:
+            print(
+                f"Multi-object recognition running (up to {app.max_objects} object(s) at once) — "
+                "'q'/Esc to quit, 'T' to cycle themes."
+            )
+        else:
+            print(
+                "Live recognition running — 'q'/Esc to quit, 'T' to cycle themes, "
+                "'N' to teach a new object once prompted."
+            )
         audio.start_ambient()
         try:
             reason = app.run()
