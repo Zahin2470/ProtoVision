@@ -15,5 +15,11 @@ Pillow>=10.0
 # --- Phase 2: ambient audio + SFX (fail-soft — see protovision/audio.py) ---
 pygame>=2.5
 
+# --- Phase 4: tiny web demo (streamlit_app.py) — only needed for the web
+# demo, not the desktop CLI, but kept in the main requirements file so
+# Streamlit Community Cloud can deploy straight from this repo with zero
+# extra configuration.
+streamlit>=1.30
+
 # --- dev / testing ---
 pytest>=8.0

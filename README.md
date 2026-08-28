@@ -50,9 +50,9 @@ Instead of training a classifier for every new object, ProtoVision:
 The core idea is simple:
 
 ```text
-Example Images
-      │
-      ▼
+   Example Images
+         │
+         ▼
 ┌─────────────────┐
 │ Frozen DINOv3   │
 │   ViT-S / 16    │
@@ -72,7 +72,7 @@ Example Images
          │
          ▼
 ┌─────────────────┐
-│ Cosine Similarity│
+│Cosine Similarity│
 │ mean / max mode │
 └────────┬────────┘
          │
@@ -92,14 +92,14 @@ Example Images
 | 🔎 Flexible matching | Supports both `mean` and `max` matching modes |
 | 🚫 Open-set fallback | Can return `unknown` when similarity is below the threshold |
 | 💾 Persistent prototypes | Prototypes can be saved to and loaded from JSON |
-| 🧪 Strong test coverage | Current test suite reports **615/615 passing** |
+| 🧪 Strong test coverage | Current test suite reports **634/634 passing** |
 | 🖥️ CPU-oriented starting point | Designed to work without requiring a GPU for the tested pipeline |
 
 ---
 
 ## 📊 Current Development Status
 
-> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — all 4 pick-a-few enrichments complete and tested. Phase 4 (post-brief extensions) — in progress.**
+> **Phase 1 — all 4 steps complete and tested. Phase 2 — all 5 steps complete and tested. Phase 3 — all 4 pick-a-few enrichments complete and tested. Phase 4 (post-brief extensions) — both complete and tested.**
 
 | Phase | Step | Component | Status |
 |:---:|:---:|---|:---:|
@@ -117,7 +117,7 @@ Example Images
 | 3 | **3** | Export/import a shareable "recognizer pack" file | ✅ Complete & tested |
 | 3 | **4** | CPU latency benchmark script | ✅ Complete & tested |
 | 4 | **1** | `detect.py` — classical multi-object region proposals + `live --multi` | ✅ Complete & tested |
-| 4 | **2** | Web demo (Streamlit/Gradio) | ⏳ Not started |
+| 4 | **2** | Web demo (Streamlit) | ✅ Complete & tested |
 
 ---
 
@@ -143,23 +143,25 @@ flowchart LR
 ```text
 ProtoVision/
 ├── main.py             # CLI entry point (enroll / live / list / export / import / benchmark)
+├── streamlit_app.py    # Tiny web demo (enroll / recognize / pack) — no camera or repo clone needed
 ├── protovision/
 │   ├── backbone.py     # DINOv3 loading + embedding extraction
 │   ├── prototypes.py   # Prototype storage + similarity matching
 │   ├── capture.py      # Camera wrapper + guide-box geometry/crop
 │   ├── enroll.py       # Object enrollment (capture → embed → save prototype)
 │   ├── live.py         # Live recognition (frame-skip inference + best_match; --multi mode)
-│   ├── ui.py            # Visual design system: typography, themes, glass panels, vignette, similarity meter
-│   ├── audio.py          # Fail-soft SFX + ambient audio (pygame)
-│   ├── pack.py            # Export/import a shareable "recognizer pack"
-│   ├── benchmark.py        # CPU inference-latency benchmark + frame_skip suggestions
-│   └── detect.py            # Classical, training-free multi-object region proposals
+│   ├── ui.py           # Visual design system: typography, themes, glass panels, vignette, similarity meter
+│   ├── audio.py        # Fail-soft SFX + ambient audio (pygame)
+│   ├── pack.py         # Export/import a shareable "recognizer pack"
+│   ├── benchmark.py    # CPU inference-latency benchmark + frame_skip suggestions
+│   ├── detect.py       # Classical, training-free multi-object region proposals
+│   └── webdemo.py      # Web demo's logic layer: backbone fallback, image conversion
 ├── assets/
-│   ├── fonts/            # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
+│   ├── fonts/          # Bundled Poppins (OFL-licensed) — Light/Regular/Medium/Bold
 │   └── audio/
-│       ├── sfx/           # enroll_success.wav, match_found.wav
-│       └── music/         # ambient_pad.wav
-├── tests/              # Automated tests (615, all passing)
+│       ├── sfx/        # enroll_success.wav, match_found.wav
+│       └── music/      # ambient_pad.wav
+├── tests/              # Automated tests (634, all passing)
 └── docs/
     └── DINOV3_SETUP.md
 ```
@@ -228,6 +230,50 @@ python main.py live --multi --max-objects 4
 place first (see `docs/DINOV3_SETUP.md`) — `list`/`export`/`import` don't,
 they just read/write `data/prototypes.json` or a pack file.
 Every flag has a `--help`: `python main.py enroll --help`.
+
+---
+
+## 🌐 Web Demo
+
+A tiny Streamlit app — enroll classes and recognize objects entirely
+through image uploads, no camera, no cloning the repo, no local install:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Three tabs: **Enroll** (upload a few photos, name the class), **Recognize**
+(upload a photo, see the predicted label and the full similarity-meter
+bar chart), and **Pack** (export your session as a shareable recognizer
+pack, or import someone else's — the same Phase 3 format the desktop
+CLI's `export`/`import` use).
+
+It tries the real DINOv3 backbone first (identical `load_default_backbone()`
+call the CLI uses — no special-casing), and falls back to a small seeded
+placeholder feature extractor if real weights aren't configured, with a
+clear on-screen banner saying which one is active. That's what lets the
+demo's *interface* be tried immediately by anyone, with zero gated
+downloads — see design decision #25 for why that trade-off is the honest
+one, not a shortcut.
+
+**Deploying it:** connect this repo to
+[Streamlit Community Cloud](https://streamlit.io/cloud) and point it at
+`streamlit_app.py` — `requirements.txt` already lists everything needed
+(Streamlit included), so it deploys with no extra configuration. Real
+DINOv3 recognition on a public deployment still needs the deployer to have
+gone through `docs/DINOV3_SETUP.md` and made weights reachable from
+wherever it's hosted; without that, visitors get the honest placeholder
+banner instead of a broken or misleading demo.
+
+Every piece of actual logic behind this app (`protovision/webdemo.py` —
+the backbone fallback, image conversion) is unit tested the normal way;
+`streamlit_app.py` itself is thin UI wiring, smoke-tested by actually
+booting the real Streamlit server headless and confirming it serves a
+clean HTTP 200 with no exceptions in the log — the same "run the real
+thing where it's feasible, keep logic separately testable where it isn't"
+split used for main.py's CLI and enroll.py/live.py's camera loops.
+
+---
 
 ## 🧪 What Is Actually Tested?
 
@@ -616,6 +662,39 @@ actual `render_preview()`
   then wrote `test_render_preview_handles_detection_near_top_edge_without_crashing`
   and the rest of `TestMultiObjectPreview` against the corrected behavior
 
+**Phase 4: web demo**
+
+- `webdemo.py`'s `PlaceholderBackbone` is tested as a REAL small conv net
+  actually being run, not a mock of one: deterministic (same image in,
+  same embedding out), different seeds give different embeddings, output
+  is L2-normalized, and — the same acceptance check used since Phase 1's
+  real-backbone test — two similarly-colored images embed more closely
+  together than two clearly different ones, proving it's a genuine
+  (if untrained) function of pixel content rather than noise
+- `get_backbone()`'s fallback is tested with the exact same
+  monkeypatch-`load_default_backbone` pattern already used for
+  `main.py`'s `_load_backbone_or_exit` — confirms it returns the real
+  backbone plus `is_real=True` when available, falls back to a working
+  (not just present) `PlaceholderBackbone` plus `is_real=False` otherwise
+- `image_to_array()` tested against every image mode a browser upload
+  could plausibly decode to (RGB, RGBA, grayscale, palette), not just the
+  happy path, confirming each converts cleanly to the RGB uint8 array the
+  rest of the pipeline expects
+- `embed_uploaded_image()` checked specifically for NOT accidentally
+  swapping color channels — compares its output against manually calling
+  `image_to_array()` + `backbone.embed(..., input_is_bgr=False)` and
+  requires them to match exactly, rather than just checking "some
+  embedding came back"
+- `streamlit_app.py` itself is real-smoke-tested, not just syntax-checked:
+  the actual Streamlit server is started headless (`streamlit run
+  streamlit_app.py --server.headless true`) and confirmed to serve a
+  clean HTTP 200 with no exceptions anywhere in the server log — run
+  twice, independently, to rule out a fluke. Every piece of logic the
+  script touches (backbone fallback, image conversion) lives in
+  `webdemo.py` and has real pytest coverage; the script itself is thin
+  wiring smoke-tested the way `main.py`'s CLI and enroll.py/live.py's
+  camera loops already are
+
 ### ⚠️ Not yet validated in this environment
 
 The following require the real DINOv3 weights and/or actual hardware:
@@ -676,6 +755,15 @@ The following require the real DINOv3 weights and/or actual hardware:
   surface first, and tuning `detect.py`'s constants
   (`DEFAULT_CANNY_LOW`/`HIGH`, area fractions) from there if it's too
   noisy or too conservative.
+- **Whether the web demo actually deploys cleanly on Streamlit Community
+  Cloud.** The real server was booted headless and smoke-tested twice in
+  this sandbox (clean HTTP 200, no exceptions in the log either time) —
+  that proves the script runs correctly as a Streamlit app; it doesn't
+  prove Streamlit Cloud's specific build environment, Python version, or
+  resource limits behave identically. And without real DINOv3 weights
+  reachable from wherever it's hosted, any public deployment will show
+  visitors the honest placeholder-backbone banner rather than real
+  recognition — see design decision #25.
 
 The current mock-model tests verify the **pipeline plumbing**, not the real-world semantic quality of DINOv3.
 
@@ -717,8 +805,8 @@ pytest tests/ -v
 Current result:
 
 ```text
-615 tests
-615 passed
+634 tests
+634 passed
 0 failed
 ```
 
@@ -1066,6 +1154,28 @@ drawn directly on each box instead — less detail per object, but it scales
 to several objects on screen at once, which a full meter per object
 wouldn't.
 
+### 25. The web demo has a working fallback instead of just failing closed
+
+DINOv3 weights are gated no matter where this demo runs — including a
+fresh Streamlit Community Cloud deployment, which starts with exactly as
+little access to Meta's download servers as this sandbox has. The
+obvious "correct" option was to just call `load_default_backbone()` and
+let it raise, showing an error page to anyone who hasn't separately set up
+weights — technically honest, but it means the *interface itself*, the
+actual point of "so people can try it without cloning the repo", is
+unreachable for almost everyone who clicks the link. `get_backbone()`
+instead tries the real backbone first (identical call, no special-casing)
+and falls back to `PlaceholderBackbone` — a small seeded conv net, not a
+trained model — so the enroll → recognize → pack workflow can be tried
+immediately by anyone, with a clear on-screen banner stating plainly that
+this isn't real DINOv3 whenever the fallback is active. The alternative
+considered and rejected was downloading a small ungated pretrained model
+(e.g. a torchvision checkpoint) as a *better* fallback — rejected because
+torchvision's own download servers aren't reachable from this sandbox
+either, and more importantly, a fallback that's ALSO a real pretrained
+model risks being mistaken for "good enough" recognition rather than read
+as the honest placeholder it needs to be.
+
 ---
 
 ## 🗺️ Roadmap
@@ -1090,7 +1200,7 @@ wouldn't.
 - [x] Phase 3: export/import a shareable "recognizer pack" file
 - [x] Phase 3: CPU latency benchmark script
 - [x] Phase 4: classical multi-object detection (`live --multi`)
-- [ ] Phase 4: tiny Streamlit/Gradio web demo
+- [x] Phase 4: tiny Streamlit web demo
 - [ ] Measure real CPU inference latency
 - [ ] Tune frame-skipping strategy
 
@@ -1107,10 +1217,10 @@ The current project includes:
 ## ⚠️ Current Limitations
 
 **Phases 1, 2, and 3 are all complete** — every feature from the original
-brief exists in code and is unit tested (615/615 passing). **Phase 4**
-(post-brief extensions, requested afterward) **is in progress**: classical
-multi-object detection (`live --multi`) is done; a tiny Streamlit/Gradio
-web demo is next.
+brief exists in code and is unit tested (634/634 passing). **Phase 4**
+(post-brief extensions, requested afterward) **is also complete**:
+classical multi-object detection (`live --multi`) and a tiny Streamlit web
+demo (`streamlit_app.py`) are both built and tested.
 
 What hasn't happened yet, and can't happen from this sandbox — all of it
 hardware-dependent, all of it on your machine, not something further
@@ -1153,13 +1263,19 @@ sandbox work can substitute for:
   objects, actual lighting, and actual shadows — see the note above and
   design decision #23; `detect.py`'s logic is thoroughly tested, its
   real-world detection quality on your specific setup isn't
+- The web demo hasn't been deployed to Streamlit Community Cloud for real
+  — it was booted headless and smoke-tested locally in this sandbox twice
+  (clean HTTP 200, no exceptions either time), which is a genuine check of
+  the script's correctness, not of Streamlit Cloud's specific environment
+  or of what a real visitor sees without real weights configured
 
 Everything in the original brief — Phases 1, 2, and 3 — is fully built and
-tested, and Phase 4's first extension (multi-object detection) is too.
-What's left there is a web demo, plus the hardware verification above:
-getting real weights running, pointing a real webcam at `enroll`/`live`
-(single- and multi-object), running the benchmark for real, and simply
-looking at and listening to the result.
+tested, and so are both of Phase 4's extensions (multi-object detection,
+web demo). What's left is entirely the hardware/deployment verification
+above: getting real weights running, pointing a real webcam at
+`enroll`/`live` (single- and multi-object), running the benchmark for
+real, actually deploying the web demo, and simply looking at and
+listening to the result.
 
 ---
 
